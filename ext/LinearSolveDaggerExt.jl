@@ -169,20 +169,83 @@ end
 
 _ntiles(DA::Dagger.DArray) = size(DA.chunks, 1)
 
+# Are Dagger's optional preconditioner backends loaded? These extensions are
+# triggered by the user doing `using IncompleteLU` / `using AlgebraicMultigrid`,
+# which is what supplies the real `BlockILUPreconditioner`/`AMGPreconditioner`
+# methods (the core package only has friendly-error stubs otherwise).
+_ilu_available() = Base.get_extension(Dagger, :IncompleteLUExt) !== nothing
+_amg_available() = Base.get_extension(Dagger, :AlgebraicMultigridExt) !== nothing
+
+# Cheap structural query of the user's operator to drive `:auto` selection.
+# Symmetry is computed once (on a fresh `A`); for a `DArray` this is a distributed
+# reduction, for a plain matrix it is a local `O(n^2)` scan -- both negligible
+# next to a solve. We deliberately do *not* probe positive-definiteness (that
+# needs a full factorization), so `:auto` optimistically picks CG for Hermitian
+# operators and flags non-convergence via the return code if it was indefinite.
+struct _OpStructure
+    hermitian::Bool
+    sparse::Bool
+end
+
+function _detect_structure(A, DA::Dagger.DArray)
+    herm = try
+        ishermitian(A)
+    catch
+        false
+    end
+    return _OpStructure(herm, _is_sparse_darray(DA))
+end
+
+# Resolve a preconditioner *selector symbol* into a concrete Dagger object.
+function _named_precond(sel::Symbol, DA::Dagger.DArray)
+    if sel === :none
+        return nothing
+    elseif sel === :jacobi
+        return Dagger.JacobiPreconditioner(DA)
+    elseif sel === :blockjacobi
+        return Dagger.BlockJacobiPreconditioner(DA)
+    elseif sel === :ilu
+        return Dagger.BlockILUPreconditioner(DA)
+    elseif sel === :amg
+        return Dagger.AMGPreconditioner(DA)
+    elseif sel === :ruge_stuben
+        return Dagger.AMGPreconditioner(DA; method = :ruge_stuben)
+    elseif sel === :smoothed_aggregation
+        return Dagger.AMGPreconditioner(DA; method = :smoothed_aggregation)
+    else
+        error("DaggerKrylovJL: unknown `precond` $(repr(sel)); use one of :none, \
+               :jacobi, :blockjacobi, :ilu, :amg, :ruge_stuben, \
+               :smoothed_aggregation, :auto, a callable `DA -> M`, or a \
+               preconditioner object")
+    end
+end
+
+# Choose a preconditioner automatically from the detected structure: a strong but
+# cheap incomplete factorization for sparse operators when its backend is loaded
+# (ILU as a general default, AMG when it is the only one available and tends to
+# shine on the elliptic/SPD problems CG targets), otherwise a cheap diagonal
+# (Jacobi) scaling, which is always available and never hurts much.
+function _auto_precond(DA::Dagger.DArray, structure::_OpStructure)
+    if structure.sparse
+        if _ilu_available()
+            return :ilu
+        elseif _amg_available()
+            return :amg
+        end
+    end
+    return :jacobi
+end
+
 # Build a Dagger preconditioner object (applied as `mul!(y, M, x)`, i.e. the
 # approximate inverse) from the `precond` selector on the algorithm.
-function _build_precond(alg::DaggerKrylovJL, DA::Dagger.DArray)
+function _build_precond(alg::DaggerKrylovJL, DA::Dagger.DArray, structure::_OpStructure)
     p = alg.precond
-    if p === nothing || p === :none
+    if p === nothing
         return nothing
-    elseif p === :jacobi
-        return Dagger.JacobiPreconditioner(DA)
-    elseif p === :blockjacobi
-        return Dagger.BlockJacobiPreconditioner(DA)
     elseif p === :auto
-        # Cheap, robust default: a diagonal preconditioner whenever the operator
-        # actually spans more than one diagonal tile (otherwise it is pointless).
-        return _ntiles(DA) > 1 ? Dagger.JacobiPreconditioner(DA) : nothing
+        return _named_precond(_auto_precond(DA, structure), DA)
+    elseif p isa Symbol
+        return _named_precond(p, DA)
     elseif p isa Function
         return p(DA)
     else
@@ -191,9 +254,14 @@ function _build_precond(alg::DaggerKrylovJL, DA::Dagger.DArray)
     end
 end
 
-# Pick the concrete Krylov method. With no symmetry information available from
-# `OperatorAssumptions`, `:auto` falls back to robust GMRES.
-_select_method(alg::DaggerKrylovJL) = alg.method === :auto ? :gmres : alg.method
+# Pick the concrete Krylov method. `:auto` uses the detected structure: CG for
+# Hermitian/symmetric operators (optimistically assuming positive-definiteness,
+# the dominant iterative use case), robust GMRES otherwise. For symmetric
+# *indefinite* systems pass `method = :minres` explicitly.
+function _select_method(alg::DaggerKrylovJL, structure::_OpStructure)
+    alg.method === :auto || return alg.method
+    return structure.hermitian ? :cg : :gmres
+end
 
 function _krylov_kwargs(alg::DaggerKrylovJL, cache::LinearCache, M, method::Symbol)
     kw = (; atol = cache.abstol, rtol = cache.reltol, itmax = cache.maxiters)
@@ -224,14 +292,17 @@ function SciMLBase.solve!(cache::LinearCache, alg::DaggerKrylovJL; kwargs...)
     bs = _blocksize(alg, size(cache.A, 1))
     if cache.isfresh
         DA = _to_dmatrix(cache.A, alg)
-        M = _build_precond(alg, DA)
-        cache.cacheval.state = (DA, M)
+        structure = _detect_structure(cache.A, DA)
+        method = _select_method(alg, structure)
+        M = _build_precond(alg, DA, structure)
+        # Cache the resolved method alongside `DA`/`M` so structure detection and
+        # preconditioner construction happen once per operator, not per RHS.
+        cache.cacheval.state = (DA, M, method)
         cache.isfresh = false
     end
-    DA, M = cache.cacheval.state
+    DA, M, method = cache.cacheval.state
 
     Db = _working_dvector(cache.b, bs)
-    method = _select_method(alg)
     x, stats = Dagger.krylov_solve(method, DA, Db; _krylov_kwargs(alg, cache, M, method)...)
     _store_solution!(cache.u, x, size(cache.A, 2))
 

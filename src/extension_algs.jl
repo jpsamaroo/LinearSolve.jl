@@ -449,16 +449,29 @@ factorization.
 ## Keyword Arguments
 
   - `method::Symbol`: Krylov method, one of `:cg`, `:minres`, `:gmres`,
-    `:bicgstab`, or `:auto` (default). `:auto` selects robust GMRES; choose `:cg`
-    for symmetric positive-definite systems and `:minres` for symmetric
-    indefinite systems for better performance.
+    `:bicgstab`, or `:auto` (default). `:auto` inspects the operator: it picks
+    `:cg` for Hermitian/symmetric matrices (optimistically assuming positive
+    definiteness, the dominant iterative use case) and robust GMRES otherwise.
+    For symmetric *indefinite* systems pass `:minres` explicitly. If CG is
+    auto-selected for an indefinite system it will simply report non-convergence
+    via the return code rather than silently returning a wrong answer.
   - `precond`: preconditioner selection. One of the symbols `:none`, `:jacobi`,
-    `:blockjacobi`, `:auto` (default), or a callable `DA -> M` returning a Dagger
-    preconditioner object (anything that supports `mul!(y, M, x)` over
-    `DVector`s, applying the approximate inverse). `:auto` uses a cheap diagonal
-    (Jacobi) preconditioner when the operator has more than one diagonal tile,
-    and none otherwise. `:blockjacobi` is stronger (it factorizes each diagonal
-    tile) but more expensive to build.
+    `:blockjacobi`, `:ilu`, `:amg`, `:ruge_stuben`, `:smoothed_aggregation`,
+    `:auto` (default); a callable `DA -> M`; or a ready-made Dagger
+    preconditioner object (anything supporting `mul!(y, M, x)` over `DVector`s,
+    applying the approximate inverse). The block preconditioners build one
+    operator per diagonal tile:
+
+      + `:jacobi` — cheap diagonal scaling (always available).
+      + `:blockjacobi` — exact `lu` of each diagonal tile (strongest, priciest).
+      + `:ilu` — incomplete-LU of each tile; requires `using IncompleteLU` and
+        sparse-backed tiles.
+      + `:amg` / `:ruge_stuben` / `:smoothed_aggregation` — an algebraic-multigrid
+        hierarchy per tile; requires `using AlgebraicMultigrid` and sparse tiles.
+
+    `:auto` queries the operator: for sparse matrices it uses block-ILU when
+    `IncompleteLU` is loaded (else AMG when `AlgebraicMultigrid` is loaded), and
+    otherwise falls back to the always-available Jacobi scaling.
   - `blocksize::Union{Int, Nothing}`: square tile edge length used when wrapping a
     non-`DArray` input (`nothing` auto-selects). Iterative solves require square
     diagonal tiles, so a square block size is always used.
