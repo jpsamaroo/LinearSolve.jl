@@ -129,6 +129,10 @@ if Base.Sys.islinux() && (GROUP == "All" || GROUP == "LinearSolvePartitionedSolv
     )
 end
 
+if (GROUP == "All" || GROUP == "LinearSolveDagger") && HAS_EXTENSIONS
+    @time @safetestset "LinearSolveDagger" include("dagger/dagger.jl")
+end
+
 if Base.Sys.islinux() && GROUP == "LinearSolvePETSc" && HAS_EXTENSIONS
     Pkg.activate("petsc")
     Pkg.develop(PackageSpec(path = dirname(@__DIR__)))

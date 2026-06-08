@@ -544,6 +544,9 @@ export SimpleGMRES
 export HYPREAlgorithm
 export PETScAlgorithm
 export PartitionedSolversAlgorithm
+export DaggerLUFactorization, DaggerCholeskyFactorization, DaggerQRFactorization,
+    DaggerKrylovJL, DaggerKrylovJL_CG, DaggerKrylovJL_MINRES, DaggerKrylovJL_GMRES,
+    DaggerKrylovJL_BICGSTAB
 export CudaOffloadFactorization
 export CudaOffloadLUFactorization
 export CudaOffloadQRFactorization
