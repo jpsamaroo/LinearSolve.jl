@@ -41,6 +41,11 @@ function find_best_always_loaded_algorithm(results_df::DataFrame, eltype_str::St
         return nothing
     end
 
+    # Only dense results inform the (dense) default-solver preferences.
+    if hasproperty(results_df, :matrix_type)
+        results_df = filter(row -> row.matrix_type == "dense", results_df)
+    end
+
     # Filter results for this element type and size range
     filtered_results = filter(
         row -> row.eltype == eltype_str &&

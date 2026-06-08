@@ -25,11 +25,16 @@ using PrettyTables
 using Statistics
 using Random
 using LinearAlgebra
+using SparseArrays
 using Printf
 using Dates
 using Base64
 using ProgressMeter
 using CPUSummary
+
+# Loaded so their LinearSolve extensions (sparse direct + Dagger solvers) activate.
+using Sparspak
+using Dagger
 
 # Hard dependency to ensure RFLUFactorization others solvers are available
 using RecursiveFactorization
@@ -49,6 +54,7 @@ export autotune_setup, share_results, AutotuneResults, plot
 
 include("algorithms.jl")
 include("gpu_detection.jl")
+include("matrix_generators.jl")
 include("benchmarking.jl")
 include("plotting.jl")
 include("telemetry.jl")
@@ -111,6 +117,12 @@ function Base.show(io::IO, results::AutotuneResults)
     # Element types tested
     eltypes = unique(results.results_df.eltype)
     println(io, "\n🔬 Element Types Tested: ", join(eltypes, ", "))
+
+    # Matrix (problem) types tested
+    if hasproperty(results.results_df, :matrix_type)
+        mtypes = unique(results.results_df.matrix_type)
+        println(io, "🧩 Matrix Types Tested: ", join(mtypes, ", "))
+    end
 
     # Matrix sizes tested
     sizes = unique(results.results_df.size)
@@ -206,8 +218,22 @@ Run a comprehensive benchmark of all available LU factorization methods and opti
   - `eltypes = (Float32, Float64, ComplexF32, ComplexF64)`: Element types to benchmark
   - `skip_missing_algs::Bool = false`: If false, error when expected algorithms are missing; if true, warn instead
   - `include_fastlapack::Bool = false`: If true, includes FastLUFactorization in benchmarks
+  - `include_sparse::Bool = true`: If true, also benchmark a suite of sparse problem
+    classes (2D Laplacian, unstructured SPD, unstructured nonsymmetric, and
+    tridiagonal) at large sparse sizes using sparse direct and Krylov solvers.
+  - `include_dagger::Bool = true`: If true, also compare Dagger.jl distributed
+    solvers (tiled LU for dense; distributed Krylov for sparse) across all
+    benchmark sizes. Dagger runs with its default thread-based scheduler; start
+    Julia with multiple threads (`julia -t auto`) to parallelize.
   - `maxtime::Float64 = 100.0`: Maximum time in seconds for each algorithm test (including accuracy check). 
     If exceeded, the run is skipped and recorded as NaN
+
+!!! warning "Sparse vs. dense metric"
+    For sparse problems the reported `gflops` is a *nominal* `2·nnz(A) / runtime`
+    throughput, not a true flop rate. It ranks solvers correctly within a single
+    (problem class, size, element type) group, but must not be compared across
+    problem classes or against the dense GFLOPs. Only dense results are used to set
+    LinearSolve's default-algorithm preferences.
 
 # Returns
 
@@ -243,10 +269,12 @@ function autotune_setup(;
         eltypes = (Float64,),
         skip_missing_algs::Bool = false,
         include_fastlapack::Bool = false,
+        include_sparse::Bool = true,
+        include_dagger::Bool = true,
         maxtime::Float64 = 100.0
     )
     @info "Starting LinearSolve.jl autotune setup..."
-    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences"
+    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_sparse=$include_sparse, include_dagger=$include_dagger"
     @info "Element types to benchmark: $(join(eltypes, ", "))"
 
     # Get system information
@@ -263,25 +291,75 @@ function autotune_setup(;
         @info "Found $(length(gpu_algs)) GPU algorithms: $(join(gpu_names, ", "))"
     end
 
-    # Combine all algorithms
-    all_algs = vcat(cpu_algs, gpu_algs)
-    all_names = vcat(cpu_names, gpu_names)
+    # Combine all dense algorithms
+    dense_algs = vcat(cpu_algs, gpu_algs)
+    dense_names = vcat(cpu_names, gpu_names)
 
-    if isempty(all_algs)
+    if isempty(dense_algs)
         error("No algorithms found! This shouldn't happen.")
     end
 
-    # Get benchmark sizes based on size categories
-    matrix_sizes = collect(get_benchmark_sizes(sizes))
-    @info "Benchmarking $(length(matrix_sizes)) matrix sizes from $(minimum(matrix_sizes)) to $(maximum(matrix_sizes))"
+    result_frames = DataFrame[]
 
-    # Run benchmarks
-    @info "Running benchmarks (this may take several minutes)..."
+    # ----- Dense benchmarks --------------------------------------------------
+    dense_problem_class = dense_problem()
+    if include_dagger
+        dagg_algs, dagg_names = get_dagger_algorithms(dense_problem_class)
+        if !isempty(dagg_algs)
+            dense_algs = vcat(dense_algs, dagg_algs)
+            dense_names = vcat(dense_names, dagg_names)
+            @info "Comparing Dagger (dense) at all sizes: $(join(dagg_names, ", "))"
+        end
+    end
+
+    dense_sizes = collect(get_benchmark_sizes(sizes; sparse = false))
+    @info "Benchmarking $(length(dense_sizes)) dense matrix sizes from $(minimum(dense_sizes)) to $(maximum(dense_sizes))"
+    @info "Running dense benchmarks (this may take several minutes)..."
     @info "Maximum time per algorithm test: $(maxtime)s"
-    results_df = benchmark_algorithms(
-        matrix_sizes, all_algs, all_names, eltypes;
-        samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime
+    push!(
+        result_frames,
+        benchmark_algorithms(
+            dense_sizes, dense_algs, dense_names, eltypes;
+            samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
+            problem = dense_problem_class
+        )
     )
+
+    # ----- Sparse benchmarks -------------------------------------------------
+    if include_sparse
+        sparse_sizes = collect(get_benchmark_sizes(sizes; sparse = true))
+        if isempty(sparse_sizes)
+            @info "No sparse sizes for requested categories; skipping sparse benchmarks."
+        else
+            # Generous iterative-solver tolerances/iteration caps; ignored by the
+            # direct solvers. Helps Krylov methods actually converge on the harder
+            # (e.g. 2D-Laplacian) systems within the correctness gate.
+            sparse_solve_kwargs = (; abstol = 1.0e-10, reltol = 1.0e-8, maxiters = 50_000)
+            @info "Benchmarking $(length(sparse_sizes)) sparse matrix sizes from $(minimum(sparse_sizes)) to $(maximum(sparse_sizes))"
+            for prob in get_sparse_problems()
+                sp_algs, sp_names = get_sparse_algorithms(prob)
+                if include_dagger
+                    dagg_algs, dagg_names = get_dagger_algorithms(prob)
+                    if !isempty(dagg_algs)
+                        sp_algs = vcat(sp_algs, dagg_algs)
+                        sp_names = vcat(sp_names, dagg_names)
+                    end
+                end
+                @info "Running sparse benchmarks for '$(prob.name)' ($(prob.description))..."
+                push!(
+                    result_frames,
+                    benchmark_algorithms(
+                        sparse_sizes, sp_algs, sp_names, eltypes;
+                        samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
+                        problem = prob,
+                        solve_kwargs = sparse_solve_kwargs
+                    )
+                )
+            end
+        end
+    end
+
+    results_df = vcat(result_frames...; cols = :union)
 
     # Display results table - show all results including NaN values to indicate what was tested
     all_results = results_df
@@ -302,10 +380,13 @@ function autotune_setup(;
     if nrow(successful_results) > 0
         @info "Benchmark completed successfully!"
 
-        # Create summary table for display - include algorithms with NaN values to show what was tested
-        # Create summary for all algorithms tested (not just successful ones)
+        # Create summary table for display - include algorithms with NaN values to show what was tested.
+        # Group by matrix type as well, since the dense and sparse GFLOPs metrics
+        # are not directly comparable.
+        group_cols = hasproperty(all_results, :matrix_type) ?
+            [:matrix_type, :algorithm] : [:algorithm]
         full_summary = combine(
-            groupby(all_results, :algorithm),
+            groupby(all_results, group_cols),
             :gflops => (
                 x -> begin
                     valid_vals = filter(!isnan, x)
@@ -322,29 +403,30 @@ function autotune_setup(;
             nrow => :total_tests
         )
 
-        # Sort by average GFLOPs, putting NaN values at the end
-        sort!(
-            full_summary, [:avg_gflops], rev = true, lt = (a, b) -> begin
-                if isnan(a) && isnan(b)
-                    return false
-                elseif isnan(a)
-                    return false
-                elseif isnan(b)
-                    return true
-                else
-                    return a < b
-                end
-            end
-        )
+        # Sort by matrix type, then by average GFLOPs descending (NaN values last).
+        # Use a temporary key mapping NaN -> -Inf so failed algorithms sort to the end.
+        full_summary.sortkey = map(x -> isnan(x) ? -Inf : x, full_summary.avg_gflops)
+        if hasproperty(full_summary, :matrix_type)
+            sort!(full_summary, [order(:matrix_type), order(:sortkey, rev = true)])
+            header = ["Matrix Type", "Algorithm", "Avg GFLOPs", "Max GFLOPs", "Success", "Total"]
+            numcols = [3, 4]
+        else
+            sort!(full_summary, order(:sortkey, rev = true))
+            header = ["Algorithm", "Avg GFLOPs", "Max GFLOPs", "Success", "Total"]
+            numcols = [2, 3]
+        end
+        select!(full_summary, Not(:sortkey))
 
         println("\n" * "="^60)
         println("BENCHMARK RESULTS SUMMARY (including failed attempts)")
+        println("Note: for sparse matrix types, GFLOPs is a nominal 2·nnz/runtime")
+        println("throughput - compare solvers only within the same matrix type.")
         println("="^60)
         pretty_table(
             full_summary,
-            header = ["Algorithm", "Avg GFLOPs", "Max GFLOPs", "Success", "Total"],
+            header = header,
             formatters = (v, i, j) -> begin
-                if j in [2, 3] && isa(v, Float64)
+                if j in numcols && isa(v, Float64)
                     return isnan(v) ? "NaN" : @sprintf("%.2f", v)
                 else
                     return v

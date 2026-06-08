@@ -353,21 +353,29 @@ Includes both summary statistics and raw performance data in collapsible section
 function format_detailed_results_markdown(df::DataFrame)
     lines = String[]
 
-    # Get unique element types
+    has_mtype = hasproperty(df, :matrix_type)
+
+    # Group by element type and (when present) matrix type. Dense and sparse share
+    # the `gflops` column but with different units, so they must be reported apart.
     eltypes = unique(df.eltype)
+    matrix_types = has_mtype ? unique(df.matrix_type) : ["dense"]
 
-    for eltype in eltypes
-        push!(lines, "#### Results for $eltype")
-        push!(lines, "")
+    for eltype in eltypes, mtype in matrix_types
+        eltype_df = filter(
+            row -> row.eltype == eltype && (!has_mtype || row.matrix_type == mtype),
+            df
+        )
 
-        # Filter results for this element type
-        eltype_df = filter(row -> row.eltype == eltype, df)
+        nrow(eltype_df) == 0 && continue
 
-        if nrow(eltype_df) == 0
-            push!(lines, "No results for this element type.")
+        heading = has_mtype ? "$eltype ($mtype)" : "$eltype"
+        push!(lines, "#### Results for $heading")
+        if has_mtype && startswith(mtype, "sparse")
             push!(lines, "")
-            continue
+            push!(lines, "> Note: for sparse problems `GFLOPs` is a nominal `2·nnz/runtime` throughput, " *
+                "useful only as a relative speed ranking within this table (not comparable to dense GFLOPs).")
         end
+        push!(lines, "")
 
         # Create a summary table with average performance per algorithm for this element type
         # Include statistics that account for NaN values

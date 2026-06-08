@@ -6,7 +6,7 @@
 Create separate plots for each element type showing GFLOPs vs matrix size for different algorithms.
 Returns a dictionary of plots keyed by element type.
 """
-function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl LU Factorization Benchmark")
+function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benchmark")
     # Filter successful results
     successful_df = filter(row -> row.success, df)
 
@@ -15,38 +15,44 @@ function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl LU F
         return Dict{String, Any}()
     end
 
+    has_mtype = hasproperty(successful_df, :matrix_type)
+
     plots_dict = Dict{String, Any}()
 
-    # Get unique element types
+    # Group plots by element type and (when present) matrix type, since the GFLOPs
+    # metric is not comparable between dense and sparse problem classes.
     eltypes = unique(successful_df.eltype)
+    matrix_types = has_mtype ? unique(successful_df.matrix_type) : ["dense"]
 
-    for eltype in eltypes
-        @info "Creating plot for element type: $eltype"
+    for eltype in eltypes, mtype in matrix_types
+        group_df = filter(
+            row -> row.eltype == eltype &&
+                (!has_mtype || row.matrix_type == mtype),
+            successful_df
+        )
 
-        # Filter results for this element type
-        eltype_df = filter(row -> row.eltype == eltype, successful_df)
-
-        if nrow(eltype_df) == 0
+        if nrow(group_df) == 0
             continue
         end
 
-        # Get unique algorithms and sizes for this element type
-        algorithms = unique(eltype_df.algorithm)
-        sizes = sort(unique(eltype_df.size))
+        is_sparse = startswith(mtype, "sparse")
+        key = has_mtype ? "$(eltype) [$(mtype)]" : eltype
+        @info "Creating plot for $key"
 
-        # Create the plot for this element type
-        title = "$title_base ($eltype)"
+        algorithms = unique(group_df.algorithm)
+
+        ylabel = is_sparse ? "Nominal throughput (2·nnz/s, GFLOPs)" : "Performance (GFLOPs)"
+        title = has_mtype ? "$title_base ($eltype, $mtype)" : "$title_base ($eltype)"
         p = plot(
             title = title,
             xlabel = "Matrix Size (N×N)",
-            ylabel = "Performance (GFLOPs)",
+            ylabel = ylabel,
             legend = :topleft,
             dpi = 300
         )
 
-        # Plot each algorithm for this element type
         for alg in algorithms
-            alg_df = filter(row -> row.algorithm == alg && !isnan(row.gflops), eltype_df)
+            alg_df = filter(row -> row.algorithm == alg && !isnan(row.gflops), group_df)
             if nrow(alg_df) > 0
                 # Sort by size for proper line plotting
                 sort!(alg_df, :size)
@@ -60,7 +66,7 @@ function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl LU F
             end
         end
 
-        plots_dict[eltype] = p
+        plots_dict[key] = p
     end
 
     return plots_dict
