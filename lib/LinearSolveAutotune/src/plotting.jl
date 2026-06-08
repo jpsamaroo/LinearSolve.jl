@@ -6,7 +6,8 @@
 Create separate plots for each element type showing GFLOPs vs matrix size for different algorithms.
 Returns a dictionary of plots keyed by element type.
 """
-function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benchmark")
+function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benchmark",
+        units::Symbol = :gflops)
     # Filter successful results
     successful_df = filter(row -> row.success, df)
 
@@ -15,6 +16,7 @@ function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benc
         return Dict{String, Any}()
     end
 
+    unit_scale, unit_label = flops_unit_info(units)
     has_mtype = hasproperty(successful_df, :matrix_type)
 
     plots_dict = Dict{String, Any}()
@@ -41,7 +43,7 @@ function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benc
 
         algorithms = unique(group_df.algorithm)
 
-        ylabel = is_sparse ? "Nominal throughput (2·nnz/s, GFLOPs)" : "Performance (GFLOPs)"
+        ylabel = is_sparse ? "Nominal throughput (2·nnz/s, $unit_label)" : "Performance ($unit_label)"
         title = has_mtype ? "$title_base ($eltype, $mtype)" : "$title_base ($eltype)"
         p = plot(
             title = title,
@@ -57,7 +59,7 @@ function create_benchmark_plots(df::DataFrame; title_base = "LinearSolve.jl Benc
                 # Sort by size for proper line plotting
                 sort!(alg_df, :size)
                 plot!(
-                    p, alg_df.size, alg_df.gflops,
+                    p, alg_df.size, alg_df.gflops .* unit_scale,
                     label = alg,
                     marker = :circle,
                     linewidth = 2,

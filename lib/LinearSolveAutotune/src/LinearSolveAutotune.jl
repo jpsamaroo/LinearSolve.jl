@@ -60,11 +60,33 @@ include("plotting.jl")
 include("telemetry.jl")
 include("preferences.jl")
 
+"""
+    flops_unit_info(units::Symbol) -> (scale, label)
+
+Map a display-unit symbol to a multiplicative scale (applied to the stored GFLOPs
+values) and a label. Supports `:gflops` and `:mflops`. `:mflops` is handy for
+sparse results, whose nominal GFLOPs are often small enough to truncate to `0.00`.
+"""
+function flops_unit_info(units::Symbol)
+    if units === :gflops
+        return (1.0, "GFLOPs")
+    elseif units === :mflops
+        return (1.0e3, "MFLOPs")
+    else
+        error("Unknown units = :$units; use :gflops or :mflops")
+    end
+end
+
 # Define the AutotuneResults struct
 struct AutotuneResults
     results_df::DataFrame
     sysinfo::Dict
+    units::Symbol
 end
+
+# Backwards-compatible constructor (defaults display units to GFLOPs)
+AutotuneResults(results_df::DataFrame, sysinfo::Dict) =
+    AutotuneResults(results_df, sysinfo, :gflops)
 
 # Display method for AutotuneResults
 function Base.show(io::IO, results::AutotuneResults)
@@ -86,6 +108,7 @@ function Base.show(io::IO, results::AutotuneResults)
     println(io, "  • Threads: ", get(results.sysinfo, "num_threads", "Unknown"), " (BLAS: ", get(results.sysinfo, "blas_num_threads", "Unknown"), ")")
 
     # Results summary - include all results to show what was attempted
+    unit_scale, unit_label = flops_unit_info(getfield(results, :units))
     all_results = results.results_df
     successful_results = filter(row -> row.success && !isnan(row.gflops), results.results_df)
     if nrow(successful_results) > 0
@@ -102,7 +125,7 @@ function Base.show(io::IO, results::AutotuneResults)
         for (i, row) in enumerate(eachrow(first(summary, 5)))
             println(
                 io, "  ", i, ". ", row.algorithm, ": ",
-                @sprintf("%.2f GFLOPs avg", row.avg_gflops)
+                @sprintf("%.2f %s avg", row.avg_gflops * unit_scale, unit_label)
             )
         end
     end
@@ -152,9 +175,9 @@ function Base.show(io::IO, results::AutotuneResults)
 end
 
 # Plot method for AutotuneResults
-function Plots.plot(results::AutotuneResults; kwargs...)
+function Plots.plot(results::AutotuneResults; units::Symbol = getfield(results, :units), kwargs...)
     # Generate plots from the results data
-    plots_dict = create_benchmark_plots(results.results_df)
+    plots_dict = create_benchmark_plots(results.results_df; units = units)
 
     if plots_dict === nothing || isempty(plots_dict)
         @warn "No data available for plotting"
@@ -218,6 +241,14 @@ Run a comprehensive benchmark of all available LU factorization methods and opti
   - `eltypes = (Float32, Float64, ComplexF32, ComplexF64)`: Element types to benchmark
   - `skip_missing_algs::Bool = false`: If false, error when expected algorithms are missing; if true, warn instead
   - `include_fastlapack::Bool = false`: If true, includes FastLUFactorization in benchmarks
+  - `include_dense::Bool = true`: If true, run the dense random-matrix benchmarks.
+    Set to `false` to benchmark only sparse problems. Note that LinearSolve's
+    default-algorithm preferences are derived from dense results only, so they will
+    not be updated when dense benchmarks are disabled.
+  - `units::Symbol = :gflops`: display units for the printed summary table, the
+    `show` output, and plots. One of `:gflops` or `:mflops`. Use `:mflops` for
+    sparse-focused runs, whose nominal GFLOPs are often small enough to display as
+    `0.00`. (The underlying `results_df` always stores GFLOPs.)
   - `include_sparse::Bool = true`: If true, also benchmark a suite of sparse problem
     classes (2D Laplacian, unstructured SPD, unstructured nonsymmetric, and
     tridiagonal) at large sparse sizes using sparse direct and Krylov solvers.
@@ -269,61 +300,71 @@ function autotune_setup(;
         eltypes = (Float64,),
         skip_missing_algs::Bool = false,
         include_fastlapack::Bool = false,
+        include_dense::Bool = true,
         include_sparse::Bool = true,
         include_dagger::Bool = true,
+        units::Symbol = :gflops,
         maxtime::Float64 = 100.0
     )
+    flops_unit_info(units)  # validate units early
+    if !include_dense && !include_sparse
+        error("Nothing to benchmark: both include_dense and include_sparse are false.")
+    end
     @info "Starting LinearSolve.jl autotune setup..."
-    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_sparse=$include_sparse, include_dagger=$include_dagger"
+    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_dense=$include_dense, include_sparse=$include_sparse, include_dagger=$include_dagger"
     @info "Element types to benchmark: $(join(eltypes, ", "))"
 
     # Get system information
     system_info = get_system_info()
     @info "System detected: $(system_info["os"]) $(system_info["arch"]) with $(system_info["num_cores"]) cores"
 
-    # Get available algorithms
-    cpu_algs, cpu_names = get_available_algorithms(; skip_missing_algs = skip_missing_algs, include_fastlapack = include_fastlapack)
-    @info "Found $(length(cpu_algs)) CPU algorithms: $(join(cpu_names, ", "))"
-
-    # Add GPU algorithms if available
-    gpu_algs, gpu_names = get_gpu_algorithms(; skip_missing_algs = skip_missing_algs)
-    if !isempty(gpu_algs)
-        @info "Found $(length(gpu_algs)) GPU algorithms: $(join(gpu_names, ", "))"
-    end
-
-    # Combine all dense algorithms
-    dense_algs = vcat(cpu_algs, gpu_algs)
-    dense_names = vcat(cpu_names, gpu_names)
-
-    if isempty(dense_algs)
-        error("No algorithms found! This shouldn't happen.")
-    end
-
     result_frames = DataFrame[]
 
     # ----- Dense benchmarks --------------------------------------------------
-    dense_problem_class = dense_problem()
-    if include_dagger
-        dagg_algs, dagg_names = get_dagger_algorithms(dense_problem_class)
-        if !isempty(dagg_algs)
-            dense_algs = vcat(dense_algs, dagg_algs)
-            dense_names = vcat(dense_names, dagg_names)
-            @info "Comparing Dagger (dense) at all sizes: $(join(dagg_names, ", "))"
-        end
-    end
+    if include_dense
+        # Get available algorithms (only needed for the dense suite)
+        cpu_algs, cpu_names = get_available_algorithms(; skip_missing_algs = skip_missing_algs, include_fastlapack = include_fastlapack)
+        @info "Found $(length(cpu_algs)) CPU algorithms: $(join(cpu_names, ", "))"
 
-    dense_sizes = collect(get_benchmark_sizes(sizes; sparse = false))
-    @info "Benchmarking $(length(dense_sizes)) dense matrix sizes from $(minimum(dense_sizes)) to $(maximum(dense_sizes))"
-    @info "Running dense benchmarks (this may take several minutes)..."
-    @info "Maximum time per algorithm test: $(maxtime)s"
-    push!(
-        result_frames,
-        benchmark_algorithms(
-            dense_sizes, dense_algs, dense_names, eltypes;
-            samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
-            problem = dense_problem_class
+        # Add GPU algorithms if available
+        gpu_algs, gpu_names = get_gpu_algorithms(; skip_missing_algs = skip_missing_algs)
+        if !isempty(gpu_algs)
+            @info "Found $(length(gpu_algs)) GPU algorithms: $(join(gpu_names, ", "))"
+        end
+
+        # Combine all dense algorithms
+        dense_algs = vcat(cpu_algs, gpu_algs)
+        dense_names = vcat(cpu_names, gpu_names)
+
+        if isempty(dense_algs)
+            error("No algorithms found! This shouldn't happen.")
+        end
+
+        dense_problem_class = dense_problem()
+        if include_dagger
+            dagg_algs, dagg_names = get_dagger_algorithms(dense_problem_class)
+            if !isempty(dagg_algs)
+                dense_algs = vcat(dense_algs, dagg_algs)
+                dense_names = vcat(dense_names, dagg_names)
+                @info "Comparing Dagger (dense) at all sizes: $(join(dagg_names, ", "))"
+            end
+        end
+
+        dense_sizes = collect(get_benchmark_sizes(sizes; sparse = false))
+        @info "Benchmarking $(length(dense_sizes)) dense matrix sizes from $(minimum(dense_sizes)) to $(maximum(dense_sizes))"
+        @info "Running dense benchmarks (this may take several minutes)..."
+        @info "Maximum time per algorithm test: $(maxtime)s"
+        push!(
+            result_frames,
+            benchmark_algorithms(
+                dense_sizes, dense_algs, dense_names, eltypes;
+                samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
+                problem = dense_problem_class
+            )
         )
-    )
+    else
+        @info "Skipping dense benchmarks (include_dense = false)."
+    end
 
     # ----- Sparse benchmarks -------------------------------------------------
     if include_sparse
@@ -380,6 +421,8 @@ function autotune_setup(;
     if nrow(successful_results) > 0
         @info "Benchmark completed successfully!"
 
+        unit_scale, unit_label = flops_unit_info(units)
+
         # Create summary table for display - include algorithms with NaN values to show what was tested.
         # Group by matrix type as well, since the dense and sparse GFLOPs metrics
         # are not directly comparable.
@@ -408,18 +451,18 @@ function autotune_setup(;
         full_summary.sortkey = map(x -> isnan(x) ? -Inf : x, full_summary.avg_gflops)
         if hasproperty(full_summary, :matrix_type)
             sort!(full_summary, [order(:matrix_type), order(:sortkey, rev = true)])
-            header = ["Matrix Type", "Algorithm", "Avg GFLOPs", "Max GFLOPs", "Success", "Total"]
+            header = ["Matrix Type", "Algorithm", "Avg $unit_label", "Max $unit_label", "Success", "Total"]
             numcols = [3, 4]
         else
             sort!(full_summary, order(:sortkey, rev = true))
-            header = ["Algorithm", "Avg GFLOPs", "Max GFLOPs", "Success", "Total"]
+            header = ["Algorithm", "Avg $unit_label", "Max $unit_label", "Success", "Total"]
             numcols = [2, 3]
         end
         select!(full_summary, Not(:sortkey))
 
         println("\n" * "="^60)
         println("BENCHMARK RESULTS SUMMARY (including failed attempts)")
-        println("Note: for sparse matrix types, GFLOPs is a nominal 2·nnz/runtime")
+        println("Note: for sparse matrix types, $unit_label is a nominal 2·nnz/runtime")
         println("throughput - compare solvers only within the same matrix type.")
         println("="^60)
         pretty_table(
@@ -427,7 +470,7 @@ function autotune_setup(;
             header = header,
             formatters = (v, i, j) -> begin
                 if j in numcols && isa(v, Float64)
-                    return isnan(v) ? "NaN" : @sprintf("%.2f", v)
+                    return isnan(v) ? "NaN" : @sprintf("%.2f", v * unit_scale)
                 else
                     return v
                 end
@@ -464,7 +507,7 @@ function autotune_setup(;
     end
 
     # Return AutotuneResults object
-    return AutotuneResults(results_df, sysinfo)
+    return AutotuneResults(results_df, sysinfo, units)
 end
 
 """

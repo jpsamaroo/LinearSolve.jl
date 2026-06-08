@@ -505,16 +505,20 @@ Dense size categories (`sparse = false`):
   - `:large` - 300:100:1000 (for larger problems)
   - `:big` - vcat(1000:2000:10000, 10000:5000:15000) (for very large/GPU problems, capped at 15000)
 
-Sparse size categories (`sparse = true`) use much larger, perfect-square sizes
-because sparse problems have `O(N)` (rather than `O(N^2)`) memory footprints. The
-sizes are perfect squares so that the 2D-Laplacian generator maps them onto exact
-`k×k` grids:
+Sparse size categories (`sparse = true`) use larger, perfect-square sizes because
+sparse problems have `O(N)` (rather than `O(N^2)`) storage. The sizes are perfect
+squares so that the 2D-Laplacian generator maps them onto exact `k×k` grids.
 
-  - `:tiny`   - [100, 400]            (10², 20²)
-  - `:small`  - [900, 2_500]          (30², 50²)
-  - `:medium` - [10_000, 40_000]      (100², 200²)
-  - `:large`  - [90_000, 160_000]     (300², 400²)
-  - `:big`    - [250_000, 562_500]    (500², 750²)
+These are kept deliberately conservative: sparse *direct* factorizations of the
+unstructured (non-PDE) test matrices suffer heavy fill-in, so the peak memory of a
+factorization can be far larger than the matrix itself. The ladder below avoids
+out-of-memory kills on typical workstations; raise it if you have the headroom.
+
+  - `:tiny`   - [100, 400]          (10², 20²)
+  - `:small`  - [900, 2_500]        (30², 50²)
+  - `:medium` - [4_900, 10_000]     (70², 100²)
+  - `:large`  - [22_500, 40_000]    (150², 200²)
+  - `:big`    - [90_000, 160_000]   (300², 400²)
 """
 function get_benchmark_sizes(size_categories; sparse::Bool = false)
     sizes = Int[]
@@ -526,11 +530,11 @@ function get_benchmark_sizes(size_categories; sparse::Bool = false)
             elseif category == :small
                 append!(sizes, [900, 2_500])
             elseif category == :medium
-                append!(sizes, [10_000, 40_000])
+                append!(sizes, [4_900, 10_000])
             elseif category == :large
-                append!(sizes, [90_000, 160_000])
+                append!(sizes, [22_500, 40_000])
             elseif category == :big
-                append!(sizes, [250_000, 562_500])
+                append!(sizes, [90_000, 160_000])
             else
                 @warn "Unknown size category: $category. Skipping."
             end
