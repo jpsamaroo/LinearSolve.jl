@@ -297,6 +297,246 @@ struct PartitionedSolversAlgorithm <: SciMLLinearSolveAlgorithm
     end
 end
 
+# ---------------------------------------------------------------------------
+# Dagger.jl distributed solvers
+# ---------------------------------------------------------------------------
+
+# Shared loading guard for the Dagger algorithms below. `@__MODULE__` resolves to
+# `LinearSolve`, so this looks up the package extension that carries the actual
+# implementation and errors with a helpful message when Dagger is not loaded.
+function _require_dagger_ext(name::AbstractString)
+    ext = Base.get_extension(@__MODULE__, :LinearSolveDaggerExt)
+    ext === nothing &&
+        error("$(name) requires Dagger.jl to be loaded, i.e. `using Dagger`")
+    return ext
+end
+
+"""
+    AbstractDaggerLinearSolveAlgorithm <: SciMLLinearSolveAlgorithm
+
+Supertype for the [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl) backed
+linear solvers. These algorithms wrap the problem's `A`/`b` as `Dagger.DArray`s
+(preserving aliasing via `view` for in-memory dense arrays) and keep the data
+distributed for as long as possible so that the factorizations/solves execute
+asynchronously across the available Dagger processors.
+
+Task placement (workers, threads, GPUs) and data locality are controlled
+externally through Dagger's scope mechanism, e.g.
+
+```julia
+Dagger.with_options(; scope = Dagger.scope(worker = 2)) do
+    solve(prob, DaggerLUFactorization())
+end
+```
+"""
+abstract type AbstractDaggerLinearSolveAlgorithm <: SciMLLinearSolveAlgorithm end
+
+"""
+```julia
+DaggerLUFactorization(; pivot = true, blocksize = nothing)
+```
+
+Distributed dense LU factorization using [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl)'s
+tiled, datadeps-scheduled `lu`. Best for square, reasonably well-conditioned
+dense systems whose element type is a BLAS float (`Float32`, `Float64`,
+`ComplexF32`, `ComplexF64`).
+
+The matrix is factorized out-of-place, so the input `A` is never mutated even
+though it is aliased into a `DArray`.
+
+## Keyword Arguments
+
+  - `pivot::Bool`: use partial (row-maximum) pivoting (`true`, default) or no
+    pivoting (`false`). No pivoting is faster but only safe for matrices that do
+    not require row interchanges (e.g. diagonally dominant or SPD).
+  - `blocksize::Union{Int, Nothing}`: square tile edge length used when wrapping a
+    non-`DArray` input. `nothing` (default) chooses a size automatically from the
+    matrix size and the number of available Dagger processors. The block size is
+    a key performance knob; see the module notes.
+
+!!! note
+
+    Requires `Dagger.jl` to be loaded, i.e. `using Dagger`.
+"""
+struct DaggerLUFactorization <: AbstractDaggerLinearSolveAlgorithm
+    pivot::Bool
+    blocksize::Union{Int, Nothing}
+    function DaggerLUFactorization(; pivot::Bool = true,
+            blocksize::Union{Int, Nothing} = nothing)
+        _require_dagger_ext("DaggerLUFactorization")
+        return new(pivot, blocksize)
+    end
+end
+
+"""
+```julia
+DaggerCholeskyFactorization(; blocksize = nothing)
+```
+
+Distributed dense Cholesky factorization via [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl).
+Use this for symmetric/Hermitian positive-definite systems; it is roughly twice
+as fast as LU. The upper triangle of `A` is assumed to define the (symmetric)
+operator and `A` is not mutated.
+
+## Keyword Arguments
+
+  - `blocksize::Union{Int, Nothing}`: square tile edge length used when wrapping a
+    non-`DArray` input (`nothing` auto-selects).
+
+!!! warning
+
+    The matrix must be positive definite; a `PosDefException` is thrown
+    otherwise.
+
+!!! note
+
+    Requires `Dagger.jl` to be loaded, i.e. `using Dagger`.
+"""
+struct DaggerCholeskyFactorization <: AbstractDaggerLinearSolveAlgorithm
+    blocksize::Union{Int, Nothing}
+    function DaggerCholeskyFactorization(; blocksize::Union{Int, Nothing} = nothing)
+        _require_dagger_ext("DaggerCholeskyFactorization")
+        return new(blocksize)
+    end
+end
+
+"""
+```julia
+DaggerQRFactorization(; blocksize = nothing, inner_blocksize = 1, domains = 1)
+```
+
+Distributed dense QR factorization via [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl).
+Handles square systems as well as overdetermined (`m > n`) least-squares
+problems. More robust than LU for ill-conditioned matrices.
+
+## Keyword Arguments
+
+  - `blocksize::Union{Int, Nothing}`: square tile edge length used when wrapping a
+    non-`DArray` input (`nothing` auto-selects).
+  - `inner_blocksize::Int`: inner blocking used for the QR T-factor workspace
+    (Dagger's `ib`).
+  - `domains::Int`: number of communication-avoiding QR domains (Dagger's `p`).
+    `> 1` enables tree QR across multiple domains.
+
+!!! note
+
+    Requires `Dagger.jl` to be loaded, i.e. `using Dagger`.
+"""
+struct DaggerQRFactorization <: AbstractDaggerLinearSolveAlgorithm
+    blocksize::Union{Int, Nothing}
+    inner_blocksize::Int
+    domains::Int
+    function DaggerQRFactorization(; blocksize::Union{Int, Nothing} = nothing,
+            inner_blocksize::Int = 1, domains::Int = 1)
+        _require_dagger_ext("DaggerQRFactorization")
+        return new(blocksize, inner_blocksize, domains)
+    end
+end
+
+"""
+```julia
+DaggerKrylovJL(; method = :auto, precond = :auto, blocksize = nothing,
+    gmres_restart = 0, kwargs...)
+```
+
+Distributed iterative (Krylov) solver via [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl),
+built on top of Krylov.jl. Works for both dense and sparse operators (a
+`SparseMatrixCSC` input is distributed into sparse tiles, preserving sparsity).
+Only matrix-vector products are formed, so this is the method of choice for
+large sparse systems, for which Dagger currently has no distributed direct
+factorization.
+
+## Keyword Arguments
+
+  - `method::Symbol`: Krylov method, one of `:cg`, `:minres`, `:gmres`,
+    `:bicgstab`, or `:auto` (default). `:auto` selects robust GMRES; choose `:cg`
+    for symmetric positive-definite systems and `:minres` for symmetric
+    indefinite systems for better performance.
+  - `precond`: preconditioner selection. One of the symbols `:none`, `:jacobi`,
+    `:blockjacobi`, `:auto` (default), or a callable `DA -> M` returning a Dagger
+    preconditioner object (anything that supports `mul!(y, M, x)` over
+    `DVector`s, applying the approximate inverse). `:auto` uses a cheap diagonal
+    (Jacobi) preconditioner when the operator has more than one diagonal tile,
+    and none otherwise. `:blockjacobi` is stronger (it factorizes each diagonal
+    tile) but more expensive to build.
+  - `blocksize::Union{Int, Nothing}`: square tile edge length used when wrapping a
+    non-`DArray` input (`nothing` auto-selects). Iterative solves require square
+    diagonal tiles, so a square block size is always used.
+  - `gmres_restart::Int`: if `> 0`, enable GMRES restarting (`restart = true`).
+    `0` (default) leaves GMRES unrestarted. The Krylov subspace size itself is
+    currently fixed by Dagger's iterative backend and is not configurable here.
+  - `kwargs...`: additional keyword arguments forwarded to the underlying
+    `Krylov.krylov_solve!` call.
+
+The convergence tolerances and iteration cap come from the `LinearSolve`
+cache (`abstol`, `reltol`, `maxiters`). LinearSolve's generic `Pl`/`Pr`
+preconditioners are not used by this backend (use `precond` instead).
+
+!!! note
+
+    Requires `Dagger.jl` to be loaded, i.e. `using Dagger`. Krylov.jl is always
+    available because it is a hard dependency of LinearSolve.
+"""
+struct DaggerKrylovJL{P, K} <: AbstractDaggerLinearSolveAlgorithm
+    method::Symbol
+    precond::P
+    blocksize::Union{Int, Nothing}
+    gmres_restart::Int
+    kwargs::K
+    function DaggerKrylovJL(; method::Symbol = :auto, precond = :auto,
+            blocksize::Union{Int, Nothing} = nothing, gmres_restart::Int = 0,
+            kwargs...)
+        _require_dagger_ext("DaggerKrylovJL")
+        method in (:auto, :cg, :minres, :gmres, :bicgstab) ||
+            error("DaggerKrylovJL: unsupported method $(method); must be one of \
+                   :auto, :cg, :minres, :gmres, :bicgstab")
+        kw = values(kwargs)
+        return new{typeof(precond), typeof(kw)}(
+            method, precond, blocksize, gmres_restart, kw
+        )
+    end
+end
+
+"""
+```julia
+DaggerKrylovJL_CG(; kwargs...)
+```
+
+Convenience constructor for [`DaggerKrylovJL`](@ref) with `method = :cg`
+(symmetric positive-definite systems). Requires `using Dagger`.
+"""
+function DaggerKrylovJL_CG end
+
+"""
+```julia
+DaggerKrylovJL_MINRES(; kwargs...)
+```
+
+Convenience constructor for [`DaggerKrylovJL`](@ref) with `method = :minres`
+(symmetric, possibly indefinite systems). Requires `using Dagger`.
+"""
+function DaggerKrylovJL_MINRES end
+
+"""
+```julia
+DaggerKrylovJL_GMRES(; kwargs...)
+```
+
+Convenience constructor for [`DaggerKrylovJL`](@ref) with `method = :gmres`
+(general nonsymmetric systems). Requires `using Dagger`.
+"""
+function DaggerKrylovJL_GMRES end
+
+"""
+```julia
+DaggerKrylovJL_BICGSTAB(; kwargs...)
+```
+
+Convenience constructor for [`DaggerKrylovJL`](@ref) with `method = :bicgstab`
+(general nonsymmetric systems, short recurrence). Requires `using Dagger`.
+"""
+function DaggerKrylovJL_BICGSTAB end
+
 # Debug: About to define CudaOffloadLUFactorization
 """
 `CudaOffloadLUFactorization()`
