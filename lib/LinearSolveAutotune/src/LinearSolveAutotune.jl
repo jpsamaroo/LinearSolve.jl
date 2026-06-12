@@ -249,14 +249,15 @@ Run a comprehensive benchmark of all available LU factorization methods and opti
     `show` output, and plots. One of `:gflops` or `:mflops`. Use `:mflops` for
     sparse-focused runs, whose nominal GFLOPs are often small enough to display as
     `0.00`. (The underlying `results_df` always stores GFLOPs.)
-  - `isolate_solvers::Bool = false`: when `true`, every individual solver run is
-    executed in its own fresh `julia` subprocess that builds its own input data.
-    If a solver exhausts memory, only that subprocess is killed (and the point is
-    recorded as an out-of-memory failure) instead of the whole autotune run
-    crashing. This is considerably slower because each run pays full process
-    startup and package-load cost, so it is off by default and intended for
-    memory-risky large runs. (It deliberately uses a plain OS subprocess rather
-    than `Distributed`, so Dagger does not try to schedule onto the child.)
+  - `isolate_solvers::Bool = false`: when `true`, solver runs are executed on a
+    *persistent isolated worker* — a long-lived child `julia` process that builds
+    its own input data and is reused across points (so process startup and
+    package-load cost is paid once per problem class, not per point). If a solver
+    exhausts memory and the OS kills the worker, only that worker dies: the point is
+    recorded as an out-of-memory failure and a fresh worker is spawned to continue.
+    A watchdog also restarts the worker if a point hangs. Off by default; intended
+    for memory-risky large runs. It deliberately uses a plain OS subprocess rather
+    than `Distributed`, so Dagger does not try to schedule onto the worker.
   - `include_sparse::Bool = true`: If true, also benchmark a suite of sparse problem
     classes (2D Laplacian, unstructured SPD, unstructured nonsymmetric, and
     tridiagonal) at large sparse sizes using sparse direct and Krylov solvers.

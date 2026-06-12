@@ -330,25 +330,35 @@ function run_single_benchmark(
     return (; gflops, success, error = error_msg, exceeded_maxtime)
 end
 
+# ---------------------------------------------------------------------------
+# Persistent isolated worker
+#
+# Isolated benchmarking runs each solver in a long-lived child `julia` process
+# rather than spawning a fresh process per point. This amortizes the (large)
+# process-startup + package-load cost across many benchmark points, while still
+# giving us OOM isolation: if a solver exhausts memory and the OS OOM killer
+# SIGKILLs the worker, only that worker dies. We detect the death, report the
+# offending point as an out-of-memory failure, and transparently respawn a new
+# worker for the remaining points.
+#
+# A plain OS subprocess is used (Pipes + `Base.julia_cmd`), **not** `Distributed`:
+# a Distributed worker would make Dagger treat the child as an extra worker and
+# schedule computation onto it, which we explicitly do not want here.
+# ---------------------------------------------------------------------------
+
 """
-    run_subprocess_benchmark(infile, outfile)
+    run_job(job) -> NamedTuple
 
-Child-process entry point for isolated benchmarking. Deserializes a payload from
-`infile`, **regenerates the input data deterministically** (same RNG seed as the
-in-process path, so it never has to transfer large matrices), runs a single
-solver via [`run_single_benchmark`](@ref), and serializes the result to `outfile`.
-
-This is run in a fresh `julia` process (see `benchmark_single_alg_subprocess`) so
-that a solver which exhausts memory only takes down its own process rather than
-the whole autotune run.
+Run one benchmark point described by `job` (a `NamedTuple`). The input data is
+**regenerated deterministically** here (same RNG seed/order as the in-process
+path), so large matrices are never sent over the pipe. Returns
+`(; n_actual, gflops, success, error, exceeded_maxtime)`.
 """
-function run_subprocess_benchmark(infile::AbstractString, outfile::AbstractString)
-    args = Serialization.deserialize(infile)
-    prob_class = args.problem
-    eltype = args.eltype
-    n = args.n
+function run_job(job)
+    prob_class = job.problem
+    eltype = job.eltype
+    n = job.n
 
-    # Reproduce exactly the same data as the in-process loop (same seed/order).
     rng = MersenneTwister(123)
     A = prob_class.generate(rng, eltype, n)
     n_actual = size(A, 1)
@@ -357,82 +367,202 @@ function run_subprocess_benchmark(infile::AbstractString, outfile::AbstractStrin
     nnz_A = prob_class.sparse ? nnz(A) : n_actual * n_actual
 
     res = run_single_benchmark(
-        prob_class, A, b, u0, nnz_A, n_actual, args.alg, args.name, eltype;
-        samples = args.samples, seconds = args.seconds, maxtime = args.maxtime,
-        check_correctness = args.check_correctness, correctness_tol = args.correctness_tol,
-        solve_kwargs = args.solve_kwargs, compute_reference = true,
+        prob_class, A, b, u0, nnz_A, n_actual, job.alg, job.name, eltype;
+        samples = job.samples, seconds = job.seconds, maxtime = job.maxtime,
+        check_correctness = job.check_correctness, correctness_tol = job.correctness_tol,
+        solve_kwargs = job.solve_kwargs, compute_reference = true,
     )
+    return merge((; n_actual = n_actual), res)
+end
 
-    Serialization.serialize(outfile, merge((; n_actual = n_actual), res))
+"""
+    worker_main()
+
+Entry point for a persistent isolated worker process. Reads serialized jobs from
+`stdin`, runs each via [`run_job`](@ref), and writes the serialized result back on
+the *original* `stdout` (the protocol channel). All ordinary output produced while
+solving is redirected to `stderr` so it can never corrupt the result stream. The
+loop exits when `stdin` is closed or a `:shutdown` sentinel is received.
+"""
+function worker_main()
+    # Capture the real stdout as the private result channel, then send any stray
+    # solver/log output to stderr so it cannot corrupt the serialized stream.
+    proto = stdout
+    redirect_stdout(stderr)
+
+    while true
+        job = try
+            Serialization.deserialize(stdin)
+        catch
+            break  # stdin closed (parent gone) → exit
+        end
+        job === :shutdown && break
+
+        result = try
+            run_job(job)
+        catch e
+            (; n_actual = get(job, :n, -1), gflops = NaN, success = false,
+                error = "Worker error: " * sprint(showerror, e), exceeded_maxtime = false)
+        end
+
+        Serialization.serialize(proto, result)
+        flush(proto)
+    end
     return nothing
 end
 
 """
-    benchmark_single_alg_subprocess(prob_class, n, eltype, alg, name; kwargs...)
+    BenchmarkWorker
 
-Run one `(algorithm, size, eltype)` benchmark point in an isolated child `julia`
-process and return `(; n_actual, gflops, success, error, exceeded_maxtime)`.
-
-A plain OS subprocess is used (via `run`/`Base.julia_cmd`), **not** `Distributed`:
-spinning up a Distributed worker would make Dagger treat the child as an extra
-worker and schedule work onto it, which we explicitly do not want here.
-
-If the child is terminated by a signal (e.g. `SIGKILL` from the OS OOM killer),
-or exits with code 137 (`128 + SIGKILL`), the point is reported as an
-out-of-memory failure instead of crashing the parent run.
+Handle for a running persistent worker: the child process plus the pipe we write
+jobs to (`in`) and read results from (`out`).
 """
-function benchmark_single_alg_subprocess(
-        prob_class::BenchmarkProblem, n, eltype::Type, alg, name;
-        samples, seconds, maxtime, check_correctness, correctness_tol,
-        solve_kwargs::NamedTuple = NamedTuple(),
-    )
-    infile = tempname()
-    outfile = tempname()
-    logfile = tempname()
+mutable struct BenchmarkWorker
+    proc::Base.Process
+    in::Base.Pipe
+    out::Base.Pipe
+end
 
-    failure(msg) = (; n_actual = n, gflops = NaN, success = false,
-        error = msg, exceeded_maxtime = false)
+"""
+    start_worker(project, nthreads) -> BenchmarkWorker
 
-    cleanup() = for f in (infile, outfile, logfile)
-        isfile(f) && rm(f; force = true)
+Launch a fresh persistent worker process. The worker loads `LinearSolveAutotune`
+from `project` and runs with `nthreads` threads (so Dagger stays multithreaded
+inside it). The worker's `stderr` is shared with the parent so its warnings remain
+visible.
+"""
+function start_worker(project::AbstractString, nthreads::Int)
+    code = "using LinearSolveAutotune; LinearSolveAutotune.worker_main()"
+    cmd = `$(Base.julia_cmd()) --project=$project --threads=$nthreads --startup-file=no -e $code`
+    inp = Base.Pipe()
+    outp = Base.Pipe()
+    proc = run(pipeline(cmd; stdin = inp, stdout = outp, stderr = stderr); wait = false)
+    # Parent only writes `inp` and reads `outp`; close the ends it doesn't use.
+    close(inp.out)
+    close(outp.in)
+    return BenchmarkWorker(proc, inp, outp)
+end
+
+"""
+    stop_worker!(w; grace = 5.0)
+
+Politely shut a worker down (sentinel + close stdin), then hard-kill it if it does
+not exit within `grace` seconds.
+"""
+function stop_worker!(w::BenchmarkWorker; grace::Float64 = 5.0)
+    try
+        if process_running(w.proc)
+            try
+                Serialization.serialize(w.in, :shutdown)
+                flush(w.in)
+            catch
+            end
+        end
+    catch
+    end
+    try; close(w.in); catch; end
+
+    if process_running(w.proc)
+        t = @async (try; wait(w.proc); catch; end)
+        deadline = time() + grace
+        while !istaskdone(t) && time() < deadline
+            sleep(0.05)
+        end
+        # SIGKILL (9): a worker hung in native code may ignore SIGTERM.
+        process_running(w.proc) && (try; kill(w.proc, 9); catch; end)
+    end
+    try; close(w.out); catch; end
+    return nothing
+end
+
+# Hard-kill a worker immediately (used on watchdog timeout). SIGKILL so it dies
+# even if it is stuck in non-Julia code.
+function kill_worker!(w::BenchmarkWorker)
+    try; process_running(w.proc) && kill(w.proc, 9); catch; end
+    try; close(w.in); catch; end
+    try; close(w.out); catch; end
+    return nothing
+end
+
+"""
+    submit_job!(w, job; timeout) -> result | :died | :timeout
+
+Send `job` to worker `w` and wait (up to `timeout` seconds) for its serialized
+result. Returns the result `NamedTuple` on success, `:died` if the worker process
+exited/closed the pipe before answering (the hallmark of an OOM SIGKILL), or
+`:timeout` if it produced nothing within the watchdog window.
+"""
+function submit_job!(w::BenchmarkWorker, job; timeout::Float64)
+    try
+        Serialization.serialize(w.in, job)
+        flush(w.in)
+    catch
+        return :died  # pipe already broken → worker gone
     end
 
-    try
-        payload = (; problem = prob_class, n = n, eltype = eltype, alg = alg, name = name,
-            samples = samples, seconds = seconds, maxtime = maxtime,
-            check_correctness = check_correctness, correctness_tol = correctness_tol,
-            solve_kwargs = solve_kwargs)
-        Serialization.serialize(infile, payload)
-
-        project = dirname(Base.active_project())
-        nthreads = max(1, Threads.nthreads())
-        code = "using LinearSolveAutotune; LinearSolveAutotune.run_subprocess_benchmark(ARGS[1], ARGS[2])"
-        cmd = `$(Base.julia_cmd()) --project=$project --threads=$nthreads --startup-file=no -e $code $infile $outfile`
-
-        proc = run(pipeline(ignorestatus(cmd); stdout = logfile, stderr = logfile); wait = true)
-
-        result = if proc.termsignal != 0
-            # Killed by a signal: the OOM killer uses SIGKILL (9), but any
-            # signal-kill here almost always means the solver blew past available
-            # memory.
-            failure("Process killed by signal $(proc.termsignal) (likely out-of-memory)")
-        elseif proc.exitcode == 137
-            failure("Process exited 137 / SIGKILL (likely out-of-memory)")
-        elseif proc.exitcode != 0
-            log = isfile(logfile) ? read(logfile, String) : ""
-            snippet = isempty(log) ? "" : ": " * last(log, 800)
-            failure("Subprocess failed (exit $(proc.exitcode))$snippet")
-        elseif isfile(outfile)
-            Serialization.deserialize(outfile)
-        else
-            failure("Subprocess exited cleanly but produced no result")
+    reader = @async begin
+        try
+            Serialization.deserialize(w.out)
+        catch e
+            e  # EOFError etc. → signal death to the caller
         end
+    end
 
-        cleanup()
-        return result
-    catch e
-        cleanup()
-        return failure("Failed to run isolated subprocess: $(e)")
+    deadline = time() + timeout
+    while !istaskdone(reader) && time() < deadline
+        sleep(0.05)
+    end
+
+    istaskdone(reader) || return :timeout
+
+    res = fetch(reader)
+    return res isa Exception ? :died : res
+end
+
+"""
+    run_point_isolated!(worker, job, project, nthreads, timeout) -> (result, worker)
+
+Run a single benchmark point on the persistent `worker`, lazily starting one if
+needed and respawning it if it dies (OOM) or hangs (watchdog `timeout`). Returns
+the result `NamedTuple` and the (possibly new) worker to use next.
+"""
+function run_point_isolated!(
+        worker::Union{Nothing, BenchmarkWorker}, job, project::AbstractString,
+        nthreads::Int, timeout::Float64
+    )
+    if worker === nothing || !process_running(worker.proc)
+        worker = start_worker(project, nthreads)
+    end
+
+    outcome = submit_job!(worker, job; timeout = timeout)
+
+    if outcome === :timeout
+        kill_worker!(worker)
+        worker = start_worker(project, nthreads)
+        result = (; n_actual = job.n, gflops = NaN, success = false,
+            error = "Exceeded isolation watchdog timeout ($(round(timeout, digits = 1))s); " *
+                "worker killed and restarted (possible hang or out-of-memory thrash)",
+            exceeded_maxtime = true)
+        return result, worker
+    elseif outcome === :died
+        sig = 0
+        ec = 0
+        try
+            wait(worker.proc)
+            sig = worker.proc.termsignal
+            ec = worker.proc.exitcode
+        catch
+        end
+        worker = start_worker(project, nthreads)
+        oom = sig != 0 || ec == 137
+        msg = oom ?
+            "Worker process killed (signal $sig, exit $ec) — likely out-of-memory; restarted" :
+            "Worker process exited unexpectedly (signal $sig, exit $ec); restarted"
+        result = (; n_actual = job.n, gflops = NaN, success = false,
+            error = msg, exceeded_maxtime = false)
+        return result, worker
+    else
+        return outcome, worker
     end
 end
 
@@ -459,12 +589,15 @@ success, error`.
     threshold (used to restrict Dagger solvers to large/big problems).
   - `solve_kwargs::NamedTuple = (;)`: keyword arguments forwarded to every `solve`
     call (e.g. tolerances/iteration caps for iterative sparse solvers).
-  - `isolate::Bool = false`: when `true`, each `(algorithm, size, eltype)` point is
-    benchmarked in a *separate, fresh `julia` process* that constructs its own input
-    data. A solver that exhausts memory then only kills its own process (reported as
-    an out-of-memory failure) rather than aborting the entire run. This is much
-    slower (each point pays full process-startup + package-load cost) and is meant
-    for memory-risky large runs; it is off by default.
+  - `isolate::Bool = false`: when `true`, solver runs are executed on a *persistent
+    isolated worker* — a long-lived child `julia` process that builds its own input
+    data and is reused across all points (so the startup + package-load cost is paid
+    once, not per point). If a solver exhausts memory and the OS kills the worker,
+    only that worker dies: the offending point is recorded as an out-of-memory
+    failure and a fresh worker is spawned for the remaining points. A watchdog also
+    restarts the worker if a point hangs. Off by default; intended for memory-risky
+    large runs. Uses a plain OS subprocess (not `Distributed`) so Dagger does not
+    schedule onto the worker.
 
 # Metric note
 
@@ -517,6 +650,17 @@ function benchmark_algorithms(
         barlen = 50, showspeed = true
     )
 
+    # Persistent isolated worker setup. The worker is started lazily on the first
+    # point and reused across the whole sweep (respawned by `run_point_isolated!`
+    # if it dies or hangs), so we pay startup cost once rather than per point.
+    iso_project = isolate ? dirname(Base.active_project()) : ""
+    iso_nthreads = max(1, Threads.nthreads())
+    # Watchdog: generous upper bound on one point's wall time (reference solve +
+    # warmup are each bounded by maxtime; the timing loop by ~samples·seconds).
+    iso_timeout = 2.0 * maxtime + samples * seconds + 120.0
+    worker = nothing
+
+    try
     for eltype in eltypes
         # Initialize blocked algorithms dict for this element type
         blocked_algorithms[string(eltype)] = Dict{String, Int}()
@@ -608,14 +752,15 @@ function benchmark_algorithms(
                     desc = "Benchmarking $name on $(n_actual)×$(n_actual) $eltype $matrix_type: "
                 )
 
-                # Run the benchmark either in-process or in an isolated child
-                # process (so an OOM in one solver doesn't take down the run).
+                # Run the benchmark either in-process or on the persistent isolated
+                # worker (so an OOM in one solver doesn't take down the run).
                 if isolate
-                    res = benchmark_single_alg_subprocess(
-                        prob_class, n, eltype, alg, name;
+                    job = (; problem = prob_class, n = n, eltype = eltype, alg = alg, name = name,
                         samples = samples, seconds = seconds, maxtime = maxtime,
                         check_correctness = check_correctness, correctness_tol = correctness_tol,
-                        solve_kwargs = solve_kwargs,
+                        solve_kwargs = solve_kwargs)
+                    res, worker = run_point_isolated!(
+                        worker, job, iso_project, iso_nthreads, iso_timeout
                     )
                     row_size = res.n_actual
                 else
@@ -651,6 +796,9 @@ function benchmark_algorithms(
                 ProgressMeter.next!(progress)
             end
         end
+    end
+    finally
+        worker isa BenchmarkWorker && stop_worker!(worker)
     end
 
     return DataFrame(results_data)
