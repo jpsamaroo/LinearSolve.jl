@@ -249,6 +249,14 @@ Run a comprehensive benchmark of all available LU factorization methods and opti
     `show` output, and plots. One of `:gflops` or `:mflops`. Use `:mflops` for
     sparse-focused runs, whose nominal GFLOPs are often small enough to display as
     `0.00`. (The underlying `results_df` always stores GFLOPs.)
+  - `isolate_solvers::Bool = false`: when `true`, every individual solver run is
+    executed in its own fresh `julia` subprocess that builds its own input data.
+    If a solver exhausts memory, only that subprocess is killed (and the point is
+    recorded as an out-of-memory failure) instead of the whole autotune run
+    crashing. This is considerably slower because each run pays full process
+    startup and package-load cost, so it is off by default and intended for
+    memory-risky large runs. (It deliberately uses a plain OS subprocess rather
+    than `Distributed`, so Dagger does not try to schedule onto the child.)
   - `include_sparse::Bool = true`: If true, also benchmark a suite of sparse problem
     classes (2D Laplacian, unstructured SPD, unstructured nonsymmetric, and
     tridiagonal) at large sparse sizes using sparse direct and Krylov solvers.
@@ -304,6 +312,7 @@ function autotune_setup(;
         include_sparse::Bool = true,
         include_dagger::Bool = true,
         units::Symbol = :gflops,
+        isolate_solvers::Bool = false,
         maxtime::Float64 = 100.0
     )
     flops_unit_info(units)  # validate units early
@@ -311,7 +320,7 @@ function autotune_setup(;
         error("Nothing to benchmark: both include_dense and include_sparse are false.")
     end
     @info "Starting LinearSolve.jl autotune setup..."
-    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_dense=$include_dense, include_sparse=$include_sparse, include_dagger=$include_dagger"
+    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_dense=$include_dense, include_sparse=$include_sparse, include_dagger=$include_dagger, isolate_solvers=$isolate_solvers"
     @info "Element types to benchmark: $(join(eltypes, ", "))"
 
     # Get system information
@@ -359,7 +368,7 @@ function autotune_setup(;
             benchmark_algorithms(
                 dense_sizes, dense_algs, dense_names, eltypes;
                 samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
-                problem = dense_problem_class
+                problem = dense_problem_class, isolate = isolate_solvers
             )
         )
     else
@@ -393,7 +402,7 @@ function autotune_setup(;
                         sparse_sizes, sp_algs, sp_names, eltypes;
                         samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
                         problem = prob,
-                        solve_kwargs = sparse_solve_kwargs
+                        solve_kwargs = sparse_solve_kwargs, isolate = isolate_solvers
                     )
                 )
             end

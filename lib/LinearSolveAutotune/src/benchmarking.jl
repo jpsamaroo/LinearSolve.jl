@@ -2,6 +2,7 @@
 
 using ProgressMeter
 using LinearAlgebra
+using Serialization
 
 """
     eltype_precheck(alg_name::String, eltype::Type)
@@ -224,10 +225,223 @@ function reference_solution_for(problem::BenchmarkProblem, A, b, u0, eltype::Typ
 end
 
 """
+    run_single_benchmark(prob_class, A, b, u0, nnz_A, n_actual, alg, name, eltype; kwargs...)
+
+Run the warmup, correctness check, and timing loop for a *single* `(algorithm,
+size, eltype)` point and return a `NamedTuple` `(; gflops, success, error,
+exceeded_maxtime)`. This is the shared core used by both the in-process benchmark
+loop and the isolated-subprocess path, so the two stay behaviorally identical.
+
+If `compute_reference = true` (used by the subprocess path) and no
+`reference_solution` is supplied, a trusted reference is computed here so the
+correctness gate still applies inside the isolated process.
+"""
+function run_single_benchmark(
+        prob_class::BenchmarkProblem, A, b, u0, nnz_A, n_actual, alg, name, eltype::Type;
+        samples, seconds, maxtime, check_correctness, correctness_tol,
+        solve_kwargs::NamedTuple = NamedTuple(),
+        reference_solution = nothing, compute_reference::Bool = false,
+    )
+    gflops = NaN
+    success = true
+    error_msg = ""
+    passed_correctness = true
+    exceeded_maxtime = false
+
+    if compute_reference && check_correctness && reference_solution === nothing
+        ref_start = time()
+        reference_solution = reference_solution_for(prob_class, A, b, u0, eltype)
+        if reference_solution !== nothing && (time() - ref_start) > maxtime
+            @warn "Reference solve for $(prob_class.name) size $n_actual ($eltype) exceeded maxtime; skipping correctness check for this run."
+            reference_solution = nothing
+        end
+    end
+
+    try
+        # Create the linear problem for this test
+        prob = LinearProblem(
+            copy(A), copy(b);
+            u0 = copy(u0),
+            alias = LinearAliasSpecifier(alias_A = true, alias_b = true)
+        )
+
+        # Time the warmup run and correctness check
+        start_time = time()
+        warmup_sol = solve(prob, alg; solve_kwargs...)
+        elapsed_time = time() - start_time
+
+        if elapsed_time > maxtime
+            exceeded_maxtime = true
+            @warn "Algorithm $name exceeded maxtime ($(round(elapsed_time, digits = 2))s > $(maxtime)s) for size $n_actual, eltype $eltype. Will skip for larger matrices."
+            success = false
+            error_msg = "Exceeded maxtime ($(round(elapsed_time, digits = 2))s)"
+            gflops = NaN
+        else
+            # Check correctness if reference solution is available
+            if check_correctness && reference_solution !== nothing
+                rel_error = norm(warmup_sol.u - reference_solution.u) /
+                    norm(reference_solution.u)
+
+                if rel_error > correctness_tol
+                    passed_correctness = false
+                    @warn "Algorithm $name failed correctness check for size $n_actual, eltype $eltype ($(prob_class.name)). " *
+                        "Relative error: $(round(rel_error, sigdigits = 3)) > tolerance: $correctness_tol. " *
+                        "Algorithm will be excluded from results."
+                    success = false
+                    error_msg = "Failed correctness check (rel_error = $(round(rel_error, sigdigits = 3)))"
+                    gflops = 0.0
+                end
+            end
+
+            # Only benchmark if correctness check passed and we didn't exceed maxtime
+            if passed_correctness && !exceeded_maxtime
+                remaining_time = maxtime - elapsed_time
+                if remaining_time < 2 * elapsed_time
+                    @warn "Algorithm $name: insufficient time remaining for benchmarking (warmup took $(round(elapsed_time, digits = 2))s). Recording as NaN."
+                    gflops = NaN
+                    success = false
+                    error_msg = "Insufficient time for benchmarking"
+                else
+                    bench_params = BenchmarkTools.Parameters(; seconds = seconds, samples = samples)
+                    _bench = @benchmarkable solve($prob, $alg; $(solve_kwargs)...) setup = (
+                        prob = LinearProblem(
+                            copy($A), copy($b);
+                            u0 = copy($u0),
+                            alias = LinearAliasSpecifier(alias_A = true, alias_b = true)
+                        )
+                    )
+                    bench = BenchmarkTools.run(_bench, bench_params)
+
+                    # Calculate GFLOPs. Dense problems use the dense-LU
+                    # flop model; sparse problems use a nominal
+                    # 2·nnz(A) throughput (see the metric note above).
+                    min_time_sec = minimum(bench.times) / 1.0e9
+                    flops = prob_class.sparse ? 2.0 * nnz_A : luflop(n_actual, n_actual)
+                    gflops = flops / min_time_sec / 1.0e9
+                end
+            end
+        end
+    catch e
+        success = false
+        error_msg = string(e)
+        gflops = NaN
+    end
+
+    return (; gflops, success, error = error_msg, exceeded_maxtime)
+end
+
+"""
+    run_subprocess_benchmark(infile, outfile)
+
+Child-process entry point for isolated benchmarking. Deserializes a payload from
+`infile`, **regenerates the input data deterministically** (same RNG seed as the
+in-process path, so it never has to transfer large matrices), runs a single
+solver via [`run_single_benchmark`](@ref), and serializes the result to `outfile`.
+
+This is run in a fresh `julia` process (see `benchmark_single_alg_subprocess`) so
+that a solver which exhausts memory only takes down its own process rather than
+the whole autotune run.
+"""
+function run_subprocess_benchmark(infile::AbstractString, outfile::AbstractString)
+    args = Serialization.deserialize(infile)
+    prob_class = args.problem
+    eltype = args.eltype
+    n = args.n
+
+    # Reproduce exactly the same data as the in-process loop (same seed/order).
+    rng = MersenneTwister(123)
+    A = prob_class.generate(rng, eltype, n)
+    n_actual = size(A, 1)
+    b = rand(rng, eltype, n_actual)
+    u0 = rand(rng, eltype, n_actual)
+    nnz_A = prob_class.sparse ? nnz(A) : n_actual * n_actual
+
+    res = run_single_benchmark(
+        prob_class, A, b, u0, nnz_A, n_actual, args.alg, args.name, eltype;
+        samples = args.samples, seconds = args.seconds, maxtime = args.maxtime,
+        check_correctness = args.check_correctness, correctness_tol = args.correctness_tol,
+        solve_kwargs = args.solve_kwargs, compute_reference = true,
+    )
+
+    Serialization.serialize(outfile, merge((; n_actual = n_actual), res))
+    return nothing
+end
+
+"""
+    benchmark_single_alg_subprocess(prob_class, n, eltype, alg, name; kwargs...)
+
+Run one `(algorithm, size, eltype)` benchmark point in an isolated child `julia`
+process and return `(; n_actual, gflops, success, error, exceeded_maxtime)`.
+
+A plain OS subprocess is used (via `run`/`Base.julia_cmd`), **not** `Distributed`:
+spinning up a Distributed worker would make Dagger treat the child as an extra
+worker and schedule work onto it, which we explicitly do not want here.
+
+If the child is terminated by a signal (e.g. `SIGKILL` from the OS OOM killer),
+or exits with code 137 (`128 + SIGKILL`), the point is reported as an
+out-of-memory failure instead of crashing the parent run.
+"""
+function benchmark_single_alg_subprocess(
+        prob_class::BenchmarkProblem, n, eltype::Type, alg, name;
+        samples, seconds, maxtime, check_correctness, correctness_tol,
+        solve_kwargs::NamedTuple = NamedTuple(),
+    )
+    infile = tempname()
+    outfile = tempname()
+    logfile = tempname()
+
+    failure(msg) = (; n_actual = n, gflops = NaN, success = false,
+        error = msg, exceeded_maxtime = false)
+
+    cleanup() = for f in (infile, outfile, logfile)
+        isfile(f) && rm(f; force = true)
+    end
+
+    try
+        payload = (; problem = prob_class, n = n, eltype = eltype, alg = alg, name = name,
+            samples = samples, seconds = seconds, maxtime = maxtime,
+            check_correctness = check_correctness, correctness_tol = correctness_tol,
+            solve_kwargs = solve_kwargs)
+        Serialization.serialize(infile, payload)
+
+        project = dirname(Base.active_project())
+        nthreads = max(1, Threads.nthreads())
+        code = "using LinearSolveAutotune; LinearSolveAutotune.run_subprocess_benchmark(ARGS[1], ARGS[2])"
+        cmd = `$(Base.julia_cmd()) --project=$project --threads=$nthreads --startup-file=no -e $code $infile $outfile`
+
+        proc = run(pipeline(ignorestatus(cmd); stdout = logfile, stderr = logfile); wait = true)
+
+        result = if proc.termsignal != 0
+            # Killed by a signal: the OOM killer uses SIGKILL (9), but any
+            # signal-kill here almost always means the solver blew past available
+            # memory.
+            failure("Process killed by signal $(proc.termsignal) (likely out-of-memory)")
+        elseif proc.exitcode == 137
+            failure("Process exited 137 / SIGKILL (likely out-of-memory)")
+        elseif proc.exitcode != 0
+            log = isfile(logfile) ? read(logfile, String) : ""
+            snippet = isempty(log) ? "" : ": " * last(log, 800)
+            failure("Subprocess failed (exit $(proc.exitcode))$snippet")
+        elseif isfile(outfile)
+            Serialization.deserialize(outfile)
+        else
+            failure("Subprocess exited cleanly but produced no result")
+        end
+
+        cleanup()
+        return result
+    catch e
+        cleanup()
+        return failure("Failed to run isolated subprocess: $(e)")
+    end
+end
+
+"""
     benchmark_algorithms(matrix_sizes, algorithms, alg_names, eltypes;
                         samples=5, seconds=0.5, sizes=[:small, :medium],
                         maxtime=100.0, problem=nothing,
-                        alg_min_sizes=Dict{String,Int}(), solve_kwargs=(;))
+                        alg_min_sizes=Dict{String,Int}(), solve_kwargs=(;),
+                        isolate=false)
 
 Benchmark the given algorithms across different matrix sizes and element types.
 Returns a DataFrame with columns `size, algorithm, eltype, matrix_type, gflops,
@@ -245,6 +459,12 @@ success, error`.
     threshold (used to restrict Dagger solvers to large/big problems).
   - `solve_kwargs::NamedTuple = (;)`: keyword arguments forwarded to every `solve`
     call (e.g. tolerances/iteration caps for iterative sparse solvers).
+  - `isolate::Bool = false`: when `true`, each `(algorithm, size, eltype)` point is
+    benchmarked in a *separate, fresh `julia` process* that constructs its own input
+    data. A solver that exhausts memory then only kills its own process (reported as
+    an out-of-memory failure) rather than aborting the entire run. This is much
+    slower (each point pays full process-startup + package-load cost) and is meant
+    for memory-risky large runs; it is off by default.
 
 # Metric note
 
@@ -259,7 +479,8 @@ function benchmark_algorithms(
         check_correctness = true, correctness_tol = 1.0e0, maxtime = 100.0,
         problem::Union{Nothing, BenchmarkProblem} = nothing,
         alg_min_sizes::AbstractDict = Dict{String, Int}(),
-        solve_kwargs::NamedTuple = NamedTuple()
+        solve_kwargs::NamedTuple = NamedTuple(),
+        isolate::Bool = false
     )
 
     prob_class = problem === nothing ? dense_problem() : problem
@@ -312,27 +533,39 @@ function benchmark_algorithms(
         end
 
         for n in matrix_sizes
-            # Create test problem with specified element type. Some generators
-            # round the size (e.g. the 2D Laplacian to a square grid), so read the
-            # actual dimension back from the generated matrix.
-            rng = MersenneTwister(123)  # Consistent seed for reproducibility
-            A = prob_class.generate(rng, eltype, n)
-            n_actual = size(A, 1)
-            b = rand(rng, eltype, n_actual)
-            u0 = rand(rng, eltype, n_actual)
-            nnz_A = prob_class.sparse ? nnz(A) : n_actual * n_actual
+            # In isolated mode the input data (and reference solution) are built
+            # inside each child process, so the parent never allocates the large
+            # matrices and can't itself be OOM-killed. Outside isolated mode we
+            # build the data once per size and share it across algorithms.
+            #
+            # Some generators round the size (e.g. the 2D Laplacian to a square
+            # grid), so read the actual dimension back from the generated matrix.
+            local A, b, u0, nnz_A, reference_solution
+            if isolate
+                A = b = u0 = nothing
+                nnz_A = 0
+                n_actual = n
+                reference_solution = nothing
+            else
+                rng = MersenneTwister(123)  # Consistent seed for reproducibility
+                A = prob_class.generate(rng, eltype, n)
+                n_actual = size(A, 1)
+                b = rand(rng, eltype, n_actual)
+                u0 = rand(rng, eltype, n_actual)
+                nnz_A = prob_class.sparse ? nnz(A) : n_actual * n_actual
 
-            # Compute reference solution if correctness check is enabled. Guard the
-            # reference solve itself against maxtime: for very large problems even a
-            # direct reference may be infeasible, in which case we skip correctness
-            # rather than aborting the benchmark.
-            reference_solution = nothing
-            if check_correctness
-                ref_start = time()
-                reference_solution = reference_solution_for(prob_class, A, b, u0, eltype)
-                if reference_solution !== nothing && (time() - ref_start) > maxtime
-                    @warn "Reference solve for $matrix_type size $n_actual ($eltype) exceeded maxtime; skipping correctness check for this size."
-                    reference_solution = nothing
+                # Compute reference solution if correctness check is enabled. Guard
+                # the reference solve itself against maxtime: for very large
+                # problems even a direct reference may be infeasible, in which case
+                # we skip correctness rather than aborting the benchmark.
+                reference_solution = nothing
+                if check_correctness
+                    ref_start = time()
+                    reference_solution = reference_solution_for(prob_class, A, b, u0, eltype)
+                    if reference_solution !== nothing && (time() - ref_start) > maxtime
+                        @warn "Reference solve for $matrix_type size $n_actual ($eltype) exceeded maxtime; skipping correctness check for this size."
+                        reference_solution = nothing
+                    end
                 end
             end
 
@@ -375,111 +608,42 @@ function benchmark_algorithms(
                     desc = "Benchmarking $name on $(n_actual)×$(n_actual) $eltype $matrix_type: "
                 )
 
-                gflops = NaN  # Use NaN for failed/timed out runs
-                success = true
-                error_msg = ""
-                passed_correctness = true
-                exceeded_maxtime = false
-
-                try
-                    # Create the linear problem for this test
-                    prob = LinearProblem(
-                        copy(A), copy(b);
-                        u0 = copy(u0),
-                        alias = LinearAliasSpecifier(alias_A = true, alias_b = true)
+                # Run the benchmark either in-process or in an isolated child
+                # process (so an OOM in one solver doesn't take down the run).
+                if isolate
+                    res = benchmark_single_alg_subprocess(
+                        prob_class, n, eltype, alg, name;
+                        samples = samples, seconds = seconds, maxtime = maxtime,
+                        check_correctness = check_correctness, correctness_tol = correctness_tol,
+                        solve_kwargs = solve_kwargs,
                     )
+                    row_size = res.n_actual
+                else
+                    res = run_single_benchmark(
+                        prob_class, A, b, u0, nnz_A, n_actual, alg, name, eltype;
+                        samples = samples, seconds = seconds, maxtime = maxtime,
+                        check_correctness = check_correctness, correctness_tol = correctness_tol,
+                        solve_kwargs = solve_kwargs, reference_solution = reference_solution,
+                    )
+                    row_size = n_actual
+                end
 
-                    # Time the warmup run and correctness check
-                    start_time = time()
-
-                    # Warmup run and correctness check - no interruption, just timing
-                    warmup_sol = nothing
-
-                    # Simply run the solve and measure time
-                    warmup_sol = solve(prob, alg; solve_kwargs...)
-                    elapsed_time = time() - start_time
-
-                    # Check if we exceeded maxtime
-                    if elapsed_time > maxtime
-                        exceeded_maxtime = true
-                        # Block this algorithm for larger matrices
-                        # Store the last size that was allowed to complete
-                        blocked_algorithms[string(eltype)][name] = n_actual
-                        @warn "Algorithm $name exceeded maxtime ($(round(elapsed_time, digits = 2))s > $(maxtime)s) for size $n_actual, eltype $eltype. Will skip for larger matrices."
-                        success = false
-                        error_msg = "Exceeded maxtime ($(round(elapsed_time, digits = 2))s)"
-                        gflops = NaN
-                    else
-                        # Successful completion within time limit
-
-                        # Check correctness if reference solution is available
-                        if check_correctness && reference_solution !== nothing
-                            # Compute relative error
-                            rel_error = norm(warmup_sol.u - reference_solution.u) /
-                                norm(reference_solution.u)
-
-                            if rel_error > correctness_tol
-                                passed_correctness = false
-                                @warn "Algorithm $name failed correctness check for size $n_actual, eltype $eltype ($matrix_type). " *
-                                    "Relative error: $(round(rel_error, sigdigits = 3)) > tolerance: $correctness_tol. " *
-                                    "Algorithm will be excluded from results."
-                                success = false
-                                error_msg = "Failed correctness check (rel_error = $(round(rel_error, sigdigits = 3)))"
-                                gflops = 0.0
-                            end
-                        end
-
-                        # Only benchmark if correctness check passed and we didn't exceed maxtime
-                        if passed_correctness && !exceeded_maxtime
-                            # Check if we have enough time remaining for benchmarking
-                            # Allow at least 2x the warmup time for benchmarking
-                            remaining_time = maxtime - elapsed_time
-                            if remaining_time < 2 * elapsed_time
-                                @warn "Algorithm $name: insufficient time remaining for benchmarking (warmup took $(round(elapsed_time, digits = 2))s). Recording as NaN."
-                                gflops = NaN
-                                success = false
-                                error_msg = "Insufficient time for benchmarking"
-                            else
-                                # Actual benchmark
-                                # Create benchmark with custom parameters
-                                bench_params = BenchmarkTools.Parameters(; seconds = seconds, samples = samples)
-                                _bench = @benchmarkable solve($prob, $alg; $(solve_kwargs)...) setup = (
-                                    prob = LinearProblem(
-                                        copy($A), copy($b);
-                                        u0 = copy($u0),
-                                        alias = LinearAliasSpecifier(alias_A = true, alias_b = true)
-                                    )
-                                )
-                                bench = BenchmarkTools.run(_bench, bench_params)
-
-                                # Calculate GFLOPs. Dense problems use the dense-LU
-                                # flop model; sparse problems use a nominal
-                                # 2·nnz(A) throughput (see the metric note above).
-                                min_time_sec = minimum(bench.times) / 1.0e9
-                                flops = prob_class.sparse ? 2.0 * nnz_A : luflop(n_actual, n_actual)
-                                gflops = flops / min_time_sec / 1.0e9
-                            end
-                        end
-                    end
-
-                catch e
-                    success = false
-                    error_msg = string(e)
-                    gflops = NaN
-                    # Don't warn for each failure, just record it
+                # Block this algorithm for larger matrices if it timed out.
+                if res.exceeded_maxtime
+                    blocked_algorithms[string(eltype)][name] = row_size
                 end
 
                 # Store result with element type and matrix-type information
                 push!(
                     results_data,
                     (
-                        size = n_actual,
+                        size = row_size,
                         algorithm = name,
                         eltype = string(eltype),
                         matrix_type = matrix_type,
-                        gflops = gflops,
-                        success = success,
-                        error = error_msg,
+                        gflops = res.gflops,
+                        success = res.success,
+                        error = res.error,
                     )
                 )
 
