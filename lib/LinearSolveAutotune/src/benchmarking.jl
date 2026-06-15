@@ -816,6 +816,8 @@ Dense size categories (`sparse = false`):
   - `:medium` - 100:50:300 (for typical problems)
   - `:large` - 300:100:1000 (for larger problems)
   - `:big` - vcat(1000:2000:10000, 10000:5000:15000) (for very large/GPU problems, capped at 15000)
+  - `:verybig` - [20_000, 35_000, 50_000] (beyond `:big`)
+  - `:superbig` - [70_000, 100_000] (largest dense tier)
 
 Sparse size categories (`sparse = true`) use larger, perfect-square sizes because
 sparse problems have `O(N)` (rather than `O(N^2)`) storage. The sizes are perfect
@@ -826,11 +828,13 @@ unstructured (non-PDE) test matrices suffer heavy fill-in, so the peak memory of
 factorization can be far larger than the matrix itself. The ladder below avoids
 out-of-memory kills on typical workstations; raise it if you have the headroom.
 
-  - `:tiny`   - [100, 400]          (10², 20²)
-  - `:small`  - [900, 2_500]        (30², 50²)
-  - `:medium` - [4_900, 10_000]     (70², 100²)
-  - `:large`  - [22_500, 40_000]    (150², 200²)
-  - `:big`    - [90_000, 160_000]   (300², 400²)
+  - `:tiny`     - [100, 400]            (10², 20²)
+  - `:small`    - [900, 2_500]          (30², 50²)
+  - `:medium`   - [4_900, 10_000]       (70², 100²)
+  - `:large`    - [22_500, 40_000]      (150², 200²)
+  - `:big`      - [90_000, 160_000]       (300², 400²)
+  - `:verybig`  - [360_000, 810_000]      (600², 900²)
+  - `:superbig` - [1_440_000, 1_960_000]  (1200², 1400², ≈2M)
 """
 function get_benchmark_sizes(size_categories; sparse::Bool = false)
     sizes = Int[]
@@ -847,6 +851,10 @@ function get_benchmark_sizes(size_categories; sparse::Bool = false)
                 append!(sizes, [22_500, 40_000])
             elseif category == :big
                 append!(sizes, [90_000, 160_000])
+            elseif category == :verybig
+                append!(sizes, [360_000, 810_000])
+            elseif category == :superbig
+                append!(sizes, [1_440_000, 1_960_000])
             else
                 @warn "Unknown size category: $category. Skipping."
             end
@@ -865,6 +873,10 @@ function get_benchmark_sizes(size_categories; sparse::Bool = false)
             append!(sizes, 300:100:1000)
         elseif category == :big
             append!(sizes, vcat(1000:2000:10000, 10000:5000:15000))  # Capped at 15000
+        elseif category == :verybig
+            append!(sizes, [20_000, 35_000, 50_000])
+        elseif category == :superbig
+            append!(sizes, [70_000, 100_000])
         else
             @warn "Unknown size category: $category. Skipping."
         end
