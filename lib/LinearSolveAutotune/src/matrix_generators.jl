@@ -248,6 +248,8 @@ function get_dagger_algorithms(problem::BenchmarkProblem)
         else
             push!(algs, DaggerLUFactorization())
             push!(names, "DaggerLUFactorization")
+            push!(algs, DaggerQRFactorization())
+            push!(names, "DaggerQRFactorization")
         end
     catch e
         @warn "Dagger solvers unavailable; skipping them. Is Dagger loaded? Error: $e"
