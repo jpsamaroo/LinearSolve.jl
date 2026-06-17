@@ -539,6 +539,10 @@ function run_point_isolated!(
     if outcome === :timeout
         kill_worker!(worker)
         worker = start_worker(project, nthreads)
+        println()  # break out of the progress-bar line before warning
+        @warn "Isolated solver '$(job.name)' exceeded the watchdog timeout " *
+            "($(round(timeout, digits = 1))s) on size $(job.n) ($(job.eltype), $(job.problem.name)) — " *
+            "possible hang or out-of-memory thrash. Worker killed and restarted; recording as failed."
         result = (; n_actual = job.n, gflops = NaN, success = false,
             error = "Exceeded isolation watchdog timeout ($(round(timeout, digits = 1))s); " *
                 "worker killed and restarted (possible hang or out-of-memory thrash)",
@@ -555,6 +559,16 @@ function run_point_isolated!(
         end
         worker = start_worker(project, nthreads)
         oom = sig != 0 || ec == 137
+        println()  # break out of the progress-bar line before warning
+        if oom
+            @warn "Isolated solver '$(job.name)' ran out of memory on size $(job.n) " *
+                "($(job.eltype), $(job.problem.name)) — worker killed (signal $sig, exit $ec). " *
+                "Restarted; recording this point as an OOM failure."
+        else
+            @warn "Isolated solver '$(job.name)' crashed the worker on size $(job.n) " *
+                "($(job.eltype), $(job.problem.name)) — process exited unexpectedly " *
+                "(signal $sig, exit $ec). Restarted; recording this point as failed."
+        end
         msg = oom ?
             "Worker process killed (signal $sig, exit $ec) — likely out-of-memory; restarted" :
             "Worker process exited unexpectedly (signal $sig, exit $ec); restarted"
