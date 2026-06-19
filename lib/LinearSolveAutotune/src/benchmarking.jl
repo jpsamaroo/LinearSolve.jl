@@ -225,6 +225,109 @@ function reference_solution_for(problem::BenchmarkProblem, A, b, u0, eltype::Typ
 end
 
 """
+    is_dagger_algorithm(name) -> Bool
+
+Whether an algorithm (by name) is one of the Dagger-backed distributed solvers.
+Used by the out-of-core path, which only those solvers support.
+"""
+is_dagger_algorithm(name::AbstractString) = startswith(name, "Dagger")
+
+"""
+    oc_tile_blocksize(n, T, override) -> Int
+
+Square tile size for an out-of-core dense `DArray`. If `override > 0` it is used
+(clamped to `n`); otherwise a tile of roughly 256 MiB is chosen for element type
+`T`, so individual tiles comfortably fit in RAM (and spill to disk) while many
+tiles tile the full matrix.
+"""
+function oc_tile_blocksize(n::Integer, ::Type{T}, override::Integer) where {T}
+    override > 0 && return clamp(Int(override), 1, Int(n))
+    target_bytes = 256 * 2^20
+    bs = max(1, floor(Int, sqrt(target_bytes / max(1, sizeof(T)))))
+    return clamp(bs, 1, Int(n))
+end
+
+"""
+    make_dense_darray(eltype, n, bs) -> Dagger.DArray
+
+Allocate an `n×n` dense random matrix as a `DArray` with square `bs×bs` tiles.
+Each tile is produced by an independent task, so with disk spilling enabled the
+matrix can exceed available RAM. This is the out-of-core analogue of [`gen_dense`](@ref).
+"""
+function make_dense_darray(::Type{T}, n::Integer, bs::Integer) where {T}
+    return rand(Dagger.Blocks(Int(bs), Int(bs)), T, Int(n), Int(n))
+end
+
+"""
+    run_point_out_of_core(prob_class, n, eltype, alg, name; kwargs...) -> (result, n_actual)
+
+Build a single out-of-core benchmark point's input and run it, returning the same
+`(; gflops, success, error, exceeded_maxtime)` result as [`run_single_benchmark`](@ref)
+plus the actual matrix size.
+
+  - Dagger solvers get a `DArray` input built tile-by-tile (dense via
+    `rand(Blocks,…)`; sparse via `distribute` of the generated sparse matrix), so
+    its tiles can spill to disk and the problem can exceed RAM.
+  - Non-Dagger solvers get the ordinary in-memory `Array`/`SparseMatrixCSC` from the
+    generator. At out-of-core scale this is expected to fail (dense allocation /
+    sparse factorization OOM); the failure is caught here and recorded instead of
+    aborting the whole run.
+
+The correctness check is disabled (no reference can be formed at this scale).
+"""
+function run_point_out_of_core(
+        prob_class::BenchmarkProblem, n, eltype::Type, alg, name;
+        samples, seconds, maxtime, solve_kwargs::NamedTuple, blocksize_override::Integer
+    )
+    try
+        rng = MersenneTwister(123)
+        local A_in, n_actual, nnz_in
+        if is_dagger_algorithm(name)
+            if prob_class.sparse
+                # Generate the sparse matrix (fits in RAM), then hand Dagger a
+                # distributed sparse DArray whose tiles can spill to disk.
+                Asp = prob_class.generate(rng, eltype, n)
+                n_actual = size(Asp, 1)
+                nnz_in = nnz(Asp)
+                bs = oc_tile_blocksize(n_actual, eltype, blocksize_override)
+                A_in = Dagger.distribute(Asp, Dagger.Blocks(bs, bs))
+            else
+                # Never materialize the full dense matrix: allocate it directly as a
+                # tiled DArray (each tile a separate, spillable allocation).
+                n_actual = n
+                nnz_in = n_actual * n_actual
+                bs = oc_tile_blocksize(n_actual, eltype, blocksize_override)
+                A_in = make_dense_darray(eltype, n_actual, bs)
+            end
+        else
+            # Ordinary in-memory input (expected to fail to allocate/factorize at
+            # out-of-core scale).
+            A_in = prob_class.generate(rng, eltype, n)
+            n_actual = size(A_in, 1)
+            nnz_in = prob_class.sparse ? nnz(A_in) : n_actual * n_actual
+        end
+
+        b = rand(rng, eltype, n_actual)
+        u0 = rand(rng, eltype, n_actual)
+
+        res = run_single_benchmark(
+            prob_class, A_in, b, u0, nnz_in, n_actual, alg, name, eltype;
+            samples = samples, seconds = seconds, maxtime = maxtime,
+            check_correctness = false, correctness_tol = 1.0,
+            solve_kwargs = solve_kwargs, reference_solution = nothing,
+        )
+        return res, n_actual
+    catch e
+        # Most importantly catches the dense `Array` allocation OOM for non-Dagger
+        # solvers, so the point is recorded as a failure rather than crashing.
+        res = (; gflops = NaN, success = false,
+            error = "Out-of-core input/solve failed: " * sprint(showerror, e),
+            exceeded_maxtime = false)
+        return res, n
+    end
+end
+
+"""
     run_single_benchmark(prob_class, A, b, u0, nnz_A, n_actual, alg, name, eltype; kwargs...)
 
 Run the warmup, correctness check, and timing loop for a *single* `(algorithm,
@@ -612,6 +715,18 @@ success, error`.
     restarts the worker if a point hangs. Off by default; intended for memory-risky
     large runs. Uses a plain OS subprocess (not `Distributed`) so Dagger does not
     schedule onto the worker.
+  - `out_of_core::Bool = false`: when `true`, the Dagger solvers receive their input
+    as a `Dagger.DArray` built tile-by-tile (dense: `rand(Blocks(bs,bs), …)`; sparse:
+    the generated sparse matrix `distribute`d into sparse tiles). With Dagger/MemPool
+    disk spilling enabled, those tiles can swap to disk, so problems larger than RAM
+    can be benchmarked. Non-Dagger solvers still run, but on ordinary in-memory
+    `Array`/`SparseMatrixCSC` inputs — at out-of-core scale they are expected to fail
+    (a dense `Array` fails to allocate; a sparse factorization runs out of memory),
+    and those failures are captured and recorded rather than aborting the run. The
+    correctness reference is skipped in this mode (it cannot be formed at scale).
+    Cannot be combined with `isolate`.
+  - `out_of_core_blocksize::Int = 0`: square tile size for the out-of-core `DArray`s.
+    `0` auto-selects a tile of roughly 256 MiB based on `eltype`.
 
 # Metric note
 
@@ -627,11 +742,18 @@ function benchmark_algorithms(
         problem::Union{Nothing, BenchmarkProblem} = nothing,
         alg_min_sizes::AbstractDict = Dict{String, Int}(),
         solve_kwargs::NamedTuple = NamedTuple(),
-        isolate::Bool = false
+        isolate::Bool = false,
+        out_of_core::Bool = false,
+        out_of_core_blocksize::Int = 0
     )
 
     prob_class = problem === nothing ? dense_problem() : problem
     matrix_type = prob_class.name
+
+    isolate && out_of_core &&
+        throw(ArgumentError("`isolate` and `out_of_core` are mutually exclusive: " *
+            "isolation runs solvers in separate processes for OOM protection, while " *
+            "out-of-core relies on in-process Dagger disk spilling to avoid OOM."))
 
     # Note: We pass benchmark parameters directly to @benchmark instead of
     # modifying BenchmarkTools.DEFAULT_PARAMETERS to avoid const assignment
@@ -699,7 +821,10 @@ function benchmark_algorithms(
             # Some generators round the size (e.g. the 2D Laplacian to a square
             # grid), so read the actual dimension back from the generated matrix.
             local A, b, u0, nnz_A, reference_solution
-            if isolate
+            if isolate || out_of_core
+                # Inputs are built per algorithm: in the isolated child process, or
+                # (out-of-core) per solver so each gets a DArray (Dagger) or an
+                # ordinary Array (others). No shared matrix/reference here.
                 A = b = u0 = nothing
                 nnz_A = 0
                 n_actual = n
@@ -766,9 +891,17 @@ function benchmark_algorithms(
                     desc = "Benchmarking $name on $(n_actual)×$(n_actual) $eltype $matrix_type: "
                 )
 
-                # Run the benchmark either in-process or on the persistent isolated
-                # worker (so an OOM in one solver doesn't take down the run).
-                if isolate
+                # Run the benchmark either in-process, on the persistent isolated
+                # worker (so an OOM in one solver doesn't take down the run), or in
+                # out-of-core mode (Dagger gets a spillable DArray; others get an
+                # ordinary Array and are expected to fail at scale).
+                if out_of_core
+                    res, row_size = run_point_out_of_core(
+                        prob_class, n, eltype, alg, name;
+                        samples = samples, seconds = seconds, maxtime = maxtime,
+                        solve_kwargs = solve_kwargs, blocksize_override = out_of_core_blocksize
+                    )
+                elseif isolate
                     job = (; problem = prob_class, n = n, eltype = eltype, alg = alg, name = name,
                         samples = samples, seconds = seconds, maxtime = maxtime,
                         check_correctness = check_correctness, correctness_tol = correctness_tol,

@@ -258,6 +258,16 @@ Run a comprehensive benchmark of all available LU factorization methods and opti
     A watchdog also restarts the worker if a point hangs. Off by default; intended
     for memory-risky large runs. It deliberately uses a plain OS subprocess rather
     than `Distributed`, so Dagger does not try to schedule onto the worker.
+  - `out_of_core::Bool = false`: when `true`, the Dagger solvers (dense *and* sparse)
+    receive their input as a `Dagger.DArray` built tile-by-tile, so with Dagger/MemPool
+    disk spilling enabled the tiles can swap to disk and problems larger than RAM can
+    be benchmarked. Non-Dagger solvers still run, but on ordinary in-memory inputs —
+    at out-of-core scale they are expected to fail (dense allocation / sparse
+    factorization OOM), which is captured and recorded rather than aborting the run
+    (useful for showing that only the Dagger solvers scale). The correctness check is
+    skipped in this mode. Mutually exclusive with `isolate_solvers`.
+  - `out_of_core_blocksize::Int = 0`: square tile size for the out-of-core
+    `DArray`s. `0` auto-selects a tile of roughly 256 MiB based on element type.
   - `include_sparse::Bool = true`: If true, also benchmark a suite of sparse problem
     classes (2D Laplacian, unstructured SPD, unstructured nonsymmetric, and
     tridiagonal) at large sparse sizes using sparse direct and Krylov solvers.
@@ -314,14 +324,25 @@ function autotune_setup(;
         include_dagger::Bool = true,
         units::Symbol = :gflops,
         isolate_solvers::Bool = false,
+        out_of_core::Bool = false,
+        out_of_core_blocksize::Int = 0,
         maxtime::Float64 = 100.0
     )
     flops_unit_info(units)  # validate units early
     if !include_dense && !include_sparse
         error("Nothing to benchmark: both include_dense and include_sparse are false.")
     end
+    if out_of_core && isolate_solvers
+        error("`out_of_core` and `isolate_solvers` are mutually exclusive: isolation " *
+            "runs solvers in separate processes for OOM protection, while out-of-core " *
+            "relies on in-process Dagger disk spilling to avoid OOM.")
+    end
+    if out_of_core && !include_dagger
+        @warn "out_of_core only affects the Dagger solvers, but include_dagger=false; " *
+            "no out-of-core benchmarking will occur."
+    end
     @info "Starting LinearSolve.jl autotune setup..."
-    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_dense=$include_dense, include_sparse=$include_sparse, include_dagger=$include_dagger, isolate_solvers=$isolate_solvers"
+    @info "Configuration: sizes=$sizes, set_preferences=$set_preferences, include_dense=$include_dense, include_sparse=$include_sparse, include_dagger=$include_dagger, isolate_solvers=$isolate_solvers, out_of_core=$out_of_core"
     @info "Element types to benchmark: $(join(eltypes, ", "))"
 
     # Get system information
@@ -369,7 +390,8 @@ function autotune_setup(;
             benchmark_algorithms(
                 dense_sizes, dense_algs, dense_names, eltypes;
                 samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
-                problem = dense_problem_class, isolate = isolate_solvers
+                problem = dense_problem_class, isolate = isolate_solvers,
+                out_of_core = out_of_core, out_of_core_blocksize = out_of_core_blocksize
             )
         )
     else
@@ -403,7 +425,8 @@ function autotune_setup(;
                         sparse_sizes, sp_algs, sp_names, eltypes;
                         samples = samples, seconds = seconds, sizes = sizes, maxtime = maxtime,
                         problem = prob,
-                        solve_kwargs = sparse_solve_kwargs, isolate = isolate_solvers
+                        solve_kwargs = sparse_solve_kwargs, isolate = isolate_solvers,
+                        out_of_core = out_of_core, out_of_core_blocksize = out_of_core_blocksize
                     )
                 )
             end
